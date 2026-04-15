@@ -147,12 +147,12 @@ export function StrategyConsole() {
   );
 
   return (
-    <div className="grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
+    <div className="grid gap-4">
       <section className="glass-panel relative overflow-hidden rounded-[30px] border border-slate-800/70 p-5">
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.14),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(249,115,22,0.1),transparent_24%)]" />
 
         <div className="relative">
-          <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="flex flex-col gap-4 2xl:flex-row 2xl:items-start 2xl:justify-between">
             <div>
               <div className="text-xs uppercase tracking-[0.35em] text-cyan-300/75">
                 Strategy Console
@@ -167,7 +167,7 @@ export function StrategyConsole() {
               </p>
             </div>
 
-            <div className="grid min-w-[220px] gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/60 p-3 text-xs text-slate-300">
+            <div className="grid w-full gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/60 p-3 text-xs text-slate-300 sm:max-w-[320px] 2xl:w-[320px]">
               <div className="flex items-center justify-between">
                 <span className="text-slate-500">Auto Sync</span>
                 <span

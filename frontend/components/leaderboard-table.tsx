@@ -103,8 +103,8 @@ export function LeaderboardTable({
           const stock = row.original;
 
           return (
-            <div className="grid gap-3 xl:grid-cols-[1fr_160px] xl:items-center">
-              <div className="grid grid-cols-3 gap-2">
+            <div className="grid gap-3 2xl:grid-cols-[minmax(0,1fr)_160px] 2xl:items-center">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                 <div className="rounded-2xl border border-slate-800/70 bg-slate-950/70 p-3">
                   <div className="text-[10px] uppercase tracking-[0.28em] text-slate-500">
                     PE Z
@@ -194,21 +194,23 @@ export function LeaderboardTable({
       </div>
 
       <div className="overflow-hidden rounded-[28px] border border-slate-800/70 bg-slate-950/60">
-        <div className="grid grid-cols-[88px_1.2fr_1.4fr_150px] gap-4 border-b border-slate-800/70 px-4 py-3 text-[10px] uppercase tracking-[0.35em] text-slate-500">
-          {table.getFlatHeaders().map((header) => (
-            <div key={header.id} className={header.id === "total_score" ? "text-right" : ""}>
-              {flexRender(header.column.columnDef.header, header.getContext())}
+        <div className="overflow-x-auto">
+          <div className="min-w-[980px]">
+            <div className="grid grid-cols-[88px_minmax(180px,1.05fr)_minmax(360px,1.5fr)_150px] gap-4 border-b border-slate-800/70 px-4 py-3 text-[10px] uppercase tracking-[0.35em] text-slate-500">
+              {table.getFlatHeaders().map((header) => (
+                <div key={header.id} className={header.id === "total_score" ? "text-right" : ""}>
+                  {flexRender(header.column.columnDef.header, header.getContext())}
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
 
-        <div className="max-h-[960px] overflow-y-auto">
+            <div className="max-h-[960px] overflow-y-auto">
           {isLoading && data.length === 0 ? (
             <div className="space-y-3 px-4 py-4">
               {Array.from({ length: 6 }).map((_, index) => (
                 <div
                   key={index}
-                  className="grid grid-cols-[88px_1.2fr_1.4fr_150px] gap-4 rounded-[24px] border border-slate-800/50 bg-slate-900/35 px-4 py-4"
+                  className="grid grid-cols-[88px_minmax(180px,1.05fr)_minmax(360px,1.5fr)_150px] gap-4 rounded-[24px] border border-slate-800/50 bg-slate-900/35 px-4 py-4"
                 >
                   <div className="h-10 animate-pulse rounded-full bg-slate-800/80" />
                   <div className="h-14 animate-pulse rounded-2xl bg-slate-800/80" />
@@ -229,7 +231,7 @@ export function LeaderboardTable({
             {table.getRowModel().rows.map((row) => (
               <div
                 key={row.id}
-                className="grid grid-cols-[88px_1.2fr_1.4fr_150px] gap-4 rounded-[24px] border border-slate-800/70 bg-slate-900/35 px-4 py-4 transition duration-200 hover:-translate-y-0.5 hover:translate-x-1 hover:border-cyan-400/20 hover:bg-slate-900/70 hover:shadow-[0_12px_40px_rgba(2,132,199,0.08)]"
+                className="grid grid-cols-[88px_minmax(180px,1.05fr)_minmax(360px,1.5fr)_150px] gap-4 rounded-[24px] border border-slate-800/70 bg-slate-900/35 px-4 py-4 transition duration-200 hover:-translate-y-0.5 hover:translate-x-1 hover:border-cyan-400/20 hover:bg-slate-900/70 hover:shadow-[0_12px_40px_rgba(2,132,199,0.08)]"
               >
                 {row.getVisibleCells().map((cell) => (
                   <div
@@ -243,6 +245,8 @@ export function LeaderboardTable({
                 ))}
               </div>
             ))}
+          </div>
+        </div>
           </div>
         </div>
       </div>

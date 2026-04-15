@@ -33,7 +33,7 @@ export default function Home() {
         </div>
       </section>
 
-      <section className="grid flex-1 gap-6 lg:grid-cols-[1fr_1.6fr]">
+      <section className="grid flex-1 gap-6 xl:grid-cols-[minmax(360px,0.92fr)_minmax(0,1.68fr)]">
         <StrategyConsole />
         <LeaderboardTable data={results} isLoading={isLoading} error={error} />
       </section>
