@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ddtrading-backend"
+version = "0.1.0"
+description = "MVP backend for a multi-factor stock scoring system"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "polars>=1.30.0",
+  "pyarrow>=18.0.0",
+  "pydantic>=2.9.0",
+  "uvicorn[standard]>=0.32.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
