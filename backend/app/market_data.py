@@ -489,6 +489,13 @@ def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
                 LOGGER.warning("stock_names loader %s failed: %s", loader.__name__, exc)
                 last_exc = exc
         if frame is None:
+            if path.exists():
+                LOGGER.warning(
+                    "all stock_names loaders failed (%r); reusing stale parquet at %s",
+                    last_exc,
+                    path,
+                )
+                return pl.read_parquet(path)
             raise RuntimeError(f"all stock_names loaders failed: {last_exc!r}")
 
         codes = frame["symbol"].astype(str)
