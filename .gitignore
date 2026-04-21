@@ -1,0 +1,30 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- 本项目数据产物（联网拉取生成，不应入库）---
+backend/data/ashare_daily.parquet
+backend/data/stock_names.parquet
+backend/data/pe_snapshot.parquet
+backend/data/*.parquet.tmp
+# 保留只读 mock（手工生成的基准数据，体积小）
+!backend/data/mock_data.parquet
+
+# --- IDE & OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- 日志 ---
+*.log
