@@ -14,6 +14,7 @@ from app.config import (
     get_data_source,
 )
 from app.schemas import ScoreRequest
+from app.strategies import ScoringStrategy, get_strategy
 
 
 FACTOR_COLUMNS = {
@@ -27,12 +28,20 @@ REQUIRED_COLUMNS = ["ticker", "name", "pe_ratio", "momentum_20d", "volatility"]
 LOGGER = logging.getLogger(__name__)
 
 
-def normalize_weights(payload: ScoreRequest) -> Dict[str, float]:
-    raw_weights = {
+def _raw_weights(payload: ScoreRequest) -> tuple[Dict[str, float], ScoringStrategy | None]:
+    """按请求解析原始权重；若带 ``strategy_id`` 则用预设覆盖。"""
+    if payload.strategy_id:
+        strategy = get_strategy(payload.strategy_id)
+        return strategy.weights(), strategy
+    return {
         "pe_weight": payload.pe_weight,
         "momentum_weight": payload.momentum_weight,
         "volatility_weight": payload.volatility_weight,
-    }
+    }, None
+
+
+def normalize_weights(payload: ScoreRequest) -> Dict[str, float]:
+    raw_weights, _ = _raw_weights(payload)
     total_abs = sum(abs(value) for value in raw_weights.values())
     return {
         key: (value / total_abs if total_abs else 0.0)
@@ -123,7 +132,12 @@ def _validate_dataset(dataset: pl.DataFrame, source_name: str) -> pl.DataFrame:
 
 
 def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
-    weights = normalize_weights(payload)
+    raw_weights, applied_strategy = _raw_weights(payload)
+    total_abs = sum(abs(v) for v in raw_weights.values())
+    weights = {
+        key: (value / total_abs if total_abs else 0.0)
+        for key, value in raw_weights.items()
+    }
     dataset = load_dataset()
 
     scored = dataset.with_columns(
@@ -161,7 +175,7 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
             }
         )
 
-    return {
+    result: Dict[str, object] = {
         "normalized_weights": {
             key: round(value, 4) for key, value in weights.items()
         },
@@ -169,3 +183,16 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
         "returned_count": len(top_50),
         "top_50": top_50,
     }
+
+    if applied_strategy is not None:
+        result["applied_strategy"] = {
+            "id": applied_strategy.id,
+            "name": applied_strategy.name,
+            "description": applied_strategy.description,
+            "weights": {
+                key: round(value, 4)
+                for key, value in applied_strategy.weights().items()
+            },
+        }
+
+    return result
