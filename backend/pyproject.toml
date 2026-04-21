@@ -9,6 +9,7 @@ description = "MVP backend for a multi-factor stock scoring system"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "akquant>=0.2.13",
   "akshare>=1.16.0",
   "fastapi>=0.115.0",
   "pandas>=2.2.0",
