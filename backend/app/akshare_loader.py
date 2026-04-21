@@ -1,220 +1,126 @@
+"""评分宽表组装层。
+
+从 :mod:`app.market_data` 维护的三张 parquet
+（``ashare_daily`` / ``stock_names`` / ``pe_snapshot``）中读取数据，计算出评分
+所需的因子（``momentum_20d``、``volatility``），并与静态字段（``name``、
+``pe_ratio``）合并成一张宽表：
+
+    ticker / name / pe_ratio / momentum_20d / volatility
+
+该模块不再直接访问 AKShare 网络接口——数据刷新全部通过 ``/refresh`` 入口驱动。
+"""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
 import logging
-import math
-import time
-from threading import Lock
-from typing import Any
 
-import pandas as pd
 import polars as pl
 
-try:
-    import akshare as ak
-except ImportError:  # pragma: no cover - optional dependency guard
-    ak = None
+from app.market_data import load_ashare_daily, load_pe_snapshot, load_stock_names
 
 
 LOGGER = logging.getLogger(__name__)
 
-_CACHE_LOCK = Lock()
-_CACHE_DATASET: pl.DataFrame | None = None
-_CACHE_EXPIRES_AT = 0.0
+MOMENTUM_LOOKBACK = 20
+VOLATILITY_LOOKBACK = 20
 
 
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
+def _compute_factors(daily: pl.DataFrame) -> pl.DataFrame:
+    """按 symbol 分组计算 momentum_20d 和 volatility。
 
-    if isinstance(value, str):
-        cleaned = value.strip().replace(",", "")
-        if cleaned in {"", "-", "--", "nan", "None"}:
-            return None
-        value = cleaned
-
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-
-    if not math.isfinite(parsed):
-        return None
-    return parsed
-
-
-def _pick_column(frame: pd.DataFrame, candidates: list[str]) -> str:
-    for column_name in candidates:
-        if column_name in frame.columns:
-            return column_name
-    raise RuntimeError(
-        f"AKShare data missing required columns. candidates={candidates}, got={list(frame.columns)}"
-    )
-
-
-def _extract_candidates(
-    spot_frame: pd.DataFrame, universe_size: int
-) -> list[dict[str, Any]]:
-    code_col = _pick_column(
-        spot_frame,
-        ["\u4ee3\u7801", "symbol", "\u80a1\u7968\u4ee3\u7801"],
-    )
-    name_col = _pick_column(
-        spot_frame,
-        ["\u540d\u79f0", "name", "\u80a1\u7968\u7b80\u79f0"],
-    )
-    pe_col = _pick_column(
-        spot_frame,
-        ["\u5e02\u76c8\u7387-\u52a8\u6001", "\u5e02\u76c8\u7387", "pe"],
-    )
-    market_cap_col = _pick_column(
-        spot_frame,
-        ["\u603b\u5e02\u503c", "\u6d41\u901a\u5e02\u503c", "market_cap"],
-    )
-
-    candidates: list[dict[str, Any]] = []
-    for _, row in spot_frame.iterrows():
-        symbol_raw = str(row.get(code_col, "")).strip()
-        symbol = "".join(ch for ch in symbol_raw if ch.isdigit())
-        if len(symbol) != 6:
-            continue
-
-        name = str(row.get(name_col, "")).strip() or symbol
-        pe_ratio = _to_float(row.get(pe_col))
-        market_cap = _to_float(row.get(market_cap_col))
-        if pe_ratio is None or market_cap is None:
-            continue
-
-        candidates.append(
-            {
-                "ticker": symbol,
-                "name": name,
-                "pe_ratio": pe_ratio,
-                "market_cap": market_cap,
+    - ``momentum_20d``: 最新收盘价 / 20 交易日前收盘价 - 1
+    - ``volatility``: 最近 20 个日收益率的总体标准差
+    """
+    if daily.height == 0:
+        return pl.DataFrame(
+            schema={
+                "symbol": pl.Utf8,
+                "momentum_20d": pl.Float64,
+                "volatility": pl.Float64,
             }
         )
 
-    candidates.sort(key=lambda item: item["market_cap"], reverse=True)
-    return candidates[:universe_size]
-
-
-def _fetch_single_symbol_factors(
-    ticker: str, name: str, pe_ratio: float, history_days: int
-) -> dict[str, float | str] | None:
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=history_days)).strftime("%Y%m%d")
-
-    history_frame = ak.stock_zh_a_hist(
-        symbol=ticker,
-        period="daily",
-        start_date=start_date,
-        end_date=end_date,
-        adjust="qfq",
+    prepared = daily.sort(["symbol", "date"]).with_columns(
+        pl.col("close").pct_change().over("symbol").alias("daily_return")
     )
-    if history_frame is None or history_frame.empty:
-        return None
 
-    close_col = _pick_column(history_frame, ["\u6536\u76d8", "close"])
-    close_series = pd.to_numeric(history_frame[close_col], errors="coerce").dropna()
+    factors = prepared.group_by("symbol", maintain_order=True).agg(
+        [
+            pl.col("close").last().alias("close_last"),
+            pl.col("close").shift(MOMENTUM_LOOKBACK).last().alias("close_base"),
+            pl.col("daily_return").tail(VOLATILITY_LOOKBACK).std(ddof=0).alias("volatility"),
+            pl.col("daily_return").drop_nulls().count().alias("valid_returns"),
+        ]
+    )
 
-    if close_series.shape[0] < 25:
-        return None
+    factors = factors.with_columns(
+        (pl.col("close_last") / pl.col("close_base") - 1.0).alias("momentum_20d")
+    )
 
-    momentum_20d = close_series.iloc[-1] / close_series.iloc[-21] - 1.0
-    returns = close_series.pct_change().dropna()
-    if returns.shape[0] < 20:
-        return None
+    factors = factors.filter(
+        pl.col("close_base").is_not_null()
+        & pl.col("volatility").is_not_null()
+        & (pl.col("valid_returns") >= VOLATILITY_LOOKBACK)
+    )
 
-    volatility = returns.tail(20).std(ddof=0)
-    if not math.isfinite(momentum_20d) or not math.isfinite(volatility):
-        return None
-
-    return {
-        "ticker": ticker,
-        "name": name,
-        "pe_ratio": float(pe_ratio),
-        "momentum_20d": float(momentum_20d),
-        "volatility": float(volatility),
-    }
+    return factors.select(["symbol", "momentum_20d", "volatility"])
 
 
-def _build_dataset(
-    universe_size: int,
-    history_days: int,
-    max_workers: int,
+def _assemble(
+    factors: pl.DataFrame,
+    names: pl.DataFrame,
+    pe: pl.DataFrame,
+    universe_size: int | None,
 ) -> pl.DataFrame:
-    if ak is None:
-        raise ModuleNotFoundError(
-            "AKShare is not installed. Install backend dependencies first: "
-            "`python -m pip install -e .`"
-        )
-
-    spot_frame = ak.stock_zh_a_spot_em()
-    if spot_frame is None or spot_frame.empty:
-        raise RuntimeError("AKShare returned empty snapshot data from stock_zh_a_spot_em.")
-
-    candidates = _extract_candidates(spot_frame, universe_size=universe_size)
-    if not candidates:
-        raise RuntimeError("No valid A-share candidates extracted from AKShare snapshot.")
-
-    rows: list[dict[str, float | str]] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(
-                _fetch_single_symbol_factors,
-                candidate["ticker"],
-                candidate["name"],
-                candidate["pe_ratio"],
-                history_days,
-            ): candidate["ticker"]
-            for candidate in candidates
-        }
-        for future in as_completed(future_map):
-            ticker = future_map[future]
-            try:
-                result = future.result()
-            except Exception as exc:  # pragma: no cover - network dependent branch
-                LOGGER.warning("AKShare history fetch failed for %s: %s", ticker, exc)
-                continue
-            if result is not None:
-                rows.append(result)
-
-    if not rows:
-        raise RuntimeError("AKShare produced zero valid factor rows.")
-
-    dataset = pl.DataFrame(rows).drop_nulls(
-        subset=["ticker", "name", "pe_ratio", "momentum_20d", "volatility"]
+    joined = (
+        factors.join(pe, on="symbol", how="inner")
+        .join(names, on="symbol", how="left")
+        .with_columns(pl.col("name").fill_null(pl.col("symbol")))
+        .rename({"symbol": "ticker"})
+        .select(["ticker", "name", "pe_ratio", "momentum_20d", "volatility"])
+        .drop_nulls()
     )
-    if dataset.height == 0:
-        raise RuntimeError("AKShare dataset is empty after null filtering.")
 
-    return dataset
+    if universe_size is not None and universe_size > 0 and joined.height > universe_size:
+        # 没有市值/成交额列时，按 ticker 字典序截断，保持确定性。
+        joined = joined.sort("ticker").head(universe_size)
+
+    return joined
 
 
 def load_akshare_dataset(
     universe_size: int,
-    history_days: int,
-    max_workers: int,
-    cache_ttl_seconds: int,
+    history_days: int | None = None,  # 保留签名兼容，不再生效
+    max_workers: int | None = None,   # 保留签名兼容，不再生效
+    cache_ttl_seconds: int | None = None,  # 保留签名兼容，不再生效
 ) -> pl.DataFrame:
-    global _CACHE_DATASET
-    global _CACHE_EXPIRES_AT
+    """组装评分宽表（纯读 parquet，不联网）。
 
-    if cache_ttl_seconds > 0:
-        with _CACHE_LOCK:
-            if _CACHE_DATASET is not None and time.time() < _CACHE_EXPIRES_AT:
-                return _CACHE_DATASET.clone()
+    若对应 parquet 不存在或已过期，会联网重建；期望常规情况下由
+    ``/refresh`` 端点提前触发。
+    """
+    del history_days, max_workers, cache_ttl_seconds  # 仅为了签名兼容
 
-    dataset = _build_dataset(
+    daily = load_ashare_daily()
+    names = load_stock_names()
+    pe_snapshot = load_pe_snapshot()
+
+    factors = _compute_factors(daily)
+    dataset = _assemble(
+        factors=factors,
+        names=names,
+        pe=pe_snapshot,
         universe_size=universe_size,
-        history_days=history_days,
-        max_workers=max_workers,
     )
 
-    if cache_ttl_seconds > 0:
-        with _CACHE_LOCK:
-            _CACHE_DATASET = dataset
-            _CACHE_EXPIRES_AT = time.time() + cache_ttl_seconds
+    if dataset.height == 0:
+        raise RuntimeError(
+            "Assembled dataset is empty. Ensure daily/pe/names parquet files "
+            "are populated (run POST /refresh first)."
+        )
 
-    return dataset.clone()
+    LOGGER.info(
+        "akshare dataset assembled: %d tickers (universe_size=%s)",
+        dataset.height,
+        universe_size,
+    )
+    return dataset

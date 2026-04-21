@@ -7,8 +7,12 @@
 2. 提供多源 fallback 的单只日线获取：tencent -> sina -> eastmoney。
 3. 过滤 A 股股票池：沪深主板 + 创业板 + 科创板，排除北交所。
 4. 把全市场日线落到 parquet，并做 TTL/原子写盘。
+5. 额外维护两张轻量面板：股票名称快照 `stock_names.parquet`，PE 快照
+   `pe_snapshot.parquet`（东财 ``stock_value_em`` 估值分析最新一行，优先
+   PE(TTM)，回退 PE(静)）。
 
-输出 schema: ``date / open / high / low / close / volume / symbol``。
+日线 schema: ``date / open / high / low / close / volume / symbol``。
+名称 schema: ``symbol / name``；PE schema: ``symbol / pe_ratio``。
 """
 from __future__ import annotations
 
@@ -381,11 +385,7 @@ def _build_daily_dataset(
 
 
 def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
-    """加载全市场 A 股日线；必要时联网重建并写 parquet。
-
-    :param refresh: 强制重建（忽略 TTL 和现存文件）。
-    """
-    # 延迟导入配置以便测试时可以 monkey-patch
+    """加载全市场 A 股日线；必要时联网重建并写 parquet。"""
     from app.config import (
         get_akshare_max_workers,
         get_daily_cache_ttl_hours,
@@ -409,13 +409,218 @@ def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
         return dataset
 
 
+# ---------------------------------------------------------------------------
+# 股票名称 & PE 快照
+# ---------------------------------------------------------------------------
+
+
+def _sibling_parquet(name: str) -> Path:
+    from app.config import get_daily_parquet_path
+
+    return get_daily_parquet_path().parent / name
+
+
+def _stock_names_path() -> Path:
+    return _sibling_parquet("stock_names.parquet")
+
+
+def _pe_snapshot_path() -> Path:
+    return _sibling_parquet("pe_snapshot.parquet")
+
+
+def _to_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN check
+        return None
+    return parsed
+
+
+def _fetch_stock_names_primary() -> pd.DataFrame:
+    raw = ak.stock_info_a_code_name()
+    code_col = "code" if "code" in raw.columns else raw.columns[0]
+    name_col = "name" if "name" in raw.columns else raw.columns[1]
+    return pd.DataFrame(
+        {
+            "symbol": raw[code_col].astype(str).str.zfill(6).values,
+            "name": raw[name_col].astype(str).str.strip().values,
+        }
+    )
+
+
+def _fetch_stock_names_fallback() -> pd.DataFrame:
+    """退路：用东财快照 ``stock_zh_a_spot_em`` 提取代码/名称。"""
+    raw = ak.stock_zh_a_spot_em()
+    code_col = "\u4ee3\u7801" if "\u4ee3\u7801" in raw.columns else "code"
+    name_col = "\u540d\u79f0" if "\u540d\u79f0" in raw.columns else "name"
+    return pd.DataFrame(
+        {
+            "symbol": raw[code_col].astype(str).str.zfill(6).values,
+            "name": raw[name_col].astype(str).str.strip().values,
+        }
+    )
+
+
+def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
+    """加载 ``symbol / name`` 快照（过滤到股票池内）。"""
+    from app.config import get_daily_cache_ttl_hours
+
+    path = _stock_names_path()
+
+    with _CACHE_LOCK:
+        if not refresh and _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
+            return pl.read_parquet(path)
+
+        if ak is None:
+            raise ModuleNotFoundError("akshare is not installed")
+
+        last_exc: Exception | None = None
+        frame: pd.DataFrame | None = None
+        for loader in (_fetch_stock_names_primary, _fetch_stock_names_fallback):
+            try:
+                frame = loader()
+                LOGGER.info("stock_names loaded via %s", loader.__name__)
+                break
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("stock_names loader %s failed: %s", loader.__name__, exc)
+                last_exc = exc
+        if frame is None:
+            raise RuntimeError(f"all stock_names loaders failed: {last_exc!r}")
+
+        codes = frame["symbol"].astype(str)
+        mask = pd.Series(False, index=codes.index)
+        for prefix in UNIVERSE_PREFIXES:
+            mask = mask | codes.str.startswith(prefix)
+
+        filtered = (
+            frame.loc[mask]
+            .drop_duplicates(subset=["symbol"])
+            .reset_index(drop=True)
+        )
+
+        dataset = pl.from_pandas(filtered)
+        _write_parquet_atomic(dataset, path)
+        LOGGER.info("stock_names snapshot rebuilt: %d rows -> %s", dataset.height, path)
+        return dataset
+
+
+def _fetch_pe_one(symbol: str) -> float | None:
+    """使用东财 ``stock_value_em`` 拉取最新 PE。
+
+    返回列含 ``PE(TTM)`` 与 ``PE(静)``，优先取 TTM。
+    """
+    raw = ak.stock_value_em(symbol=symbol)
+    if raw is None or raw.empty:
+        return None
+    for candidate in ("PE(TTM)", "PE(\u9759)"):  # PE(静)
+        if candidate in raw.columns:
+            cleaned = raw.dropna(subset=[candidate])
+            if cleaned.empty:
+                continue
+            value = _to_float(cleaned.iloc[-1][candidate])
+            if value is not None and value > 0:
+                return value
+    return None
+
+
+def _build_pe_snapshot(
+    *, max_workers: int, universe: list[str] | None = None
+) -> pl.DataFrame:
+    if ak is None:
+        raise ModuleNotFoundError("akshare is not installed")
+
+    tickers = universe if universe is not None else list_universe()
+    if not tickers:
+        raise RuntimeError("empty universe — cannot build pe snapshot")
+
+    LOGGER.info(
+        "building pe snapshot for %d symbols (workers=%d)",
+        len(tickers),
+        max_workers,
+    )
+
+    rows: list[dict[str, object]] = []
+    failed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_fetch_pe_one, sym): sym for sym in tickers
+        }
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            try:
+                pe_value = future.result()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("pe fetch failed for %s: %s", symbol, exc)
+                failed += 1
+                continue
+            if pe_value is None:
+                continue
+            rows.append({"symbol": symbol, "pe_ratio": pe_value})
+
+    if not rows:
+        raise RuntimeError("no pe rows fetched successfully")
+
+    LOGGER.info(
+        "pe snapshot built: ok=%d, missing/failed=%d",
+        len(rows),
+        len(tickers) - len(rows),
+    )
+    return pl.DataFrame(rows)
+
+
+def load_pe_snapshot(*, refresh: bool = False) -> pl.DataFrame:
+    """加载 ``symbol / pe_ratio`` 快照；必要时联网重建并写 parquet。"""
+    from app.config import get_akshare_max_workers, get_daily_cache_ttl_hours
+
+    path = _pe_snapshot_path()
+
+    with _CACHE_LOCK:
+        if not refresh and _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
+            return pl.read_parquet(path)
+
+        dataset = _build_pe_snapshot(max_workers=get_akshare_max_workers())
+        _write_parquet_atomic(dataset, path)
+        return dataset
+
+
+# ---------------------------------------------------------------------------
+# 对外手动刷新入口
+# ---------------------------------------------------------------------------
+
+
+def refresh_market_data() -> dict[str, object]:
+    """一站式刷新：全市场日线 + 名称 + PE 快照，返回落盘摘要。"""
+    daily = load_ashare_daily(refresh=True)
+    names = load_stock_names(refresh=True)
+    pe_snapshot = load_pe_snapshot(refresh=True)
+
+    return {
+        "daily": {
+            "rows": daily.height,
+            "symbols": daily.select(pl.col("symbol").n_unique()).item(),
+            "path": str(_resolve_parquet_path()),
+        },
+        "names": {
+            "rows": names.height,
+            "path": str(_stock_names_path()),
+        },
+        "pe": {
+            "rows": pe_snapshot.height,
+            "path": str(_pe_snapshot_path()),
+        },
+    }
+
+
 def refresh_ashare_daily() -> dict[str, int | str]:
-    """对外暴露的手动刷新入口，返回落盘摘要。"""
+    """仅刷新日线 parquet（不触发 PE/名称刷新）。"""
     dataset = load_ashare_daily(refresh=True)
-    distinct_symbols = dataset.select(pl.col("symbol").n_unique()).item()
     return {
         "rows": dataset.height,
-        "symbols": distinct_symbols,
+        "symbols": dataset.select(pl.col("symbol").n_unique()).item(),
         "path": str(_resolve_parquet_path()),
     }
 
