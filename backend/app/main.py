@@ -11,7 +11,7 @@ from app.scoring import score_stocks
 app = FastAPI(
     title="DDTrading Scoring API",
     version="0.1.0",
-    description="MVP API for multi-factor stock ranking based on Parquet data.",
+    description="MVP API for multi-factor stock ranking (AKShare or Parquet data source).",
 )
 
 app.add_middleware(

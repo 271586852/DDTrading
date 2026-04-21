@@ -1,7 +1,8 @@
 param(
     [int]$FrontendPort = 3000,
     [int]$BackendPort = 8011,
-    [string]$HostAddress = "127.0.0.1"
+    [string]$HostAddress = "127.0.0.1",
+    [string]$DataSource = "auto"
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +19,7 @@ Start-Process powershell -ArgumentList @(
     "-File", "`"$backendScript`"",
     "-HostAddress", $HostAddress,
     "-Port", $BackendPort,
+    "-DataSource", $DataSource,
     "-CorsOrigins", $corsOrigins
 )
 

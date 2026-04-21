@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from typing import Dict
+import logging
 
 import polars as pl
 
-from app.config import get_data_path
+from app.config import (
+    get_akshare_cache_ttl_seconds,
+    get_akshare_history_days,
+    get_akshare_max_workers,
+    get_akshare_universe_size,
+    get_data_path,
+    get_data_source,
+)
 from app.schemas import ScoreRequest
 
 
@@ -13,6 +21,10 @@ FACTOR_COLUMNS = {
     "momentum_weight": "momentum_20d",
     "volatility_weight": "volatility",
 }
+
+REQUIRED_COLUMNS = ["ticker", "name", "pe_ratio", "momentum_20d", "volatility"]
+
+LOGGER = logging.getLogger(__name__)
 
 
 def normalize_weights(payload: ScoreRequest) -> Dict[str, float]:
@@ -56,12 +68,58 @@ def _scale_scores_to_100(frame: pl.DataFrame, score_column: str) -> pl.DataFrame
 
 
 def load_dataset() -> pl.DataFrame:
+    data_source = get_data_source()
+
+    if data_source == "parquet":
+        return _load_dataset_from_parquet()
+
+    if data_source == "akshare":
+        return _load_dataset_from_akshare()
+
+    # auto mode: prefer AKShare, fallback to local parquet when network/data source fails
+    try:
+        return _load_dataset_from_akshare()
+    except Exception as ak_exc:
+        LOGGER.warning(
+            "AKShare dataset load failed in auto mode (%s). Fallback to parquet.",
+            type(ak_exc).__name__,
+        )
+        return _load_dataset_from_parquet()
+
+
+def _load_dataset_from_parquet() -> pl.DataFrame:
     data_path = get_data_path()
     if not data_path.exists():
         raise FileNotFoundError(
             f"Mock dataset not found at '{data_path}'. Run the generator script first."
         )
-    return pl.read_parquet(data_path)
+    dataset = pl.read_parquet(data_path)
+    return _validate_dataset(dataset, source_name="parquet")
+
+
+def _load_dataset_from_akshare() -> pl.DataFrame:
+    from app.akshare_loader import load_akshare_dataset
+
+    dataset = load_akshare_dataset(
+        universe_size=get_akshare_universe_size(),
+        history_days=get_akshare_history_days(),
+        max_workers=get_akshare_max_workers(),
+        cache_ttl_seconds=get_akshare_cache_ttl_seconds(),
+    )
+    return _validate_dataset(dataset, source_name="akshare")
+
+
+def _validate_dataset(dataset: pl.DataFrame, source_name: str) -> pl.DataFrame:
+    missing_columns = [column for column in REQUIRED_COLUMNS if column not in dataset.columns]
+    if missing_columns:
+        raise ValueError(
+            f"{source_name} dataset missing required columns: {', '.join(missing_columns)}"
+        )
+
+    cleaned = dataset.select(REQUIRED_COLUMNS).drop_nulls(subset=REQUIRED_COLUMNS)
+    if cleaned.height == 0:
+        raise ValueError(f"{source_name} dataset has no valid rows after null filtering.")
+    return cleaned
 
 
 def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
