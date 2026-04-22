@@ -7,12 +7,15 @@ from typing import Literal
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_PATH = BACKEND_ROOT / "data" / "mock_data.parquet"
+DEFAULT_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "ashare_daily.parquet"
 DEFAULT_FRONTEND_ORIGIN = "http://127.0.0.1:3000"
 DEFAULT_DATA_SOURCE: Literal["auto", "parquet", "akshare"] = "auto"
 DEFAULT_AKSHARE_UNIVERSE_SIZE = 300
 DEFAULT_AKSHARE_HISTORY_DAYS = 120
 DEFAULT_AKSHARE_MAX_WORKERS = 8
 DEFAULT_AKSHARE_CACHE_TTL_SECONDS = 600
+DEFAULT_DAILY_HISTORY_DAYS = 3650
+DEFAULT_DAILY_CACHE_TTL_HOURS = 24
 
 
 def get_data_path() -> Path:
@@ -72,6 +75,32 @@ def get_akshare_cache_ttl_seconds() -> int:
     return _get_int_env(
         "DDTRADING_AKSHARE_CACHE_TTL_SECONDS",
         default=DEFAULT_AKSHARE_CACHE_TTL_SECONDS,
+        minimum=0,
+    )
+
+
+def get_daily_parquet_path() -> Path:
+    """本地全市场日线 parquet 的存储路径。"""
+    raw_path = os.getenv("DDTRADING_DAILY_PARQUET_PATH")
+    if not raw_path:
+        return DEFAULT_DAILY_PARQUET_PATH
+    return Path(raw_path).expanduser().resolve()
+
+
+def get_daily_history_days() -> int:
+    """本地日线缓存覆盖的历史天数。默认约 10 年。"""
+    return _get_int_env(
+        "DDTRADING_DAILY_HISTORY_DAYS",
+        default=DEFAULT_DAILY_HISTORY_DAYS,
+        minimum=30,
+    )
+
+
+def get_daily_cache_ttl_hours() -> int:
+    """本地日线 parquet 的 TTL（小时）。为 0 表示永不自动刷新，只走 /refresh。"""
+    return _get_int_env(
+        "DDTRADING_DAILY_CACHE_TTL_HOURS",
+        default=DEFAULT_DAILY_CACHE_TTL_HOURS,
         minimum=0,
     )
 
