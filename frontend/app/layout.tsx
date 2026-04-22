@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "DDTrading Quant Scorer",
-  description: "Multi-factor stock scoring dashboard MVP",
+  title: "DDTrading Quant Console",
+  description: "量化交易分析终端：策略 + 单股 / 全市场评分 + 行情",
 };
 
 export default function RootLayout({

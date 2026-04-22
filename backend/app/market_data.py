@@ -704,6 +704,132 @@ def refresh_market_data() -> dict[str, object]:
     }
 
 
+def _fetch_single_stock_name(symbol: str) -> str | None:
+    """尽力从 spot 接口捞一个股票中文名，失败返回 None。"""
+    code = _normalize_symbol(symbol)
+    for loader in (_fetch_sina_stock_snapshot, _fetch_stock_names_fallback):
+        try:
+            frame = loader()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("single-name loader %s failed: %s", loader.__name__, exc)
+            continue
+        matched = frame.loc[frame["symbol"] == code]
+        if not matched.empty:
+            return str(matched.iloc[0]["name"]).strip() or None
+    return None
+
+
+def _upsert_daily(new_daily: pl.DataFrame, symbol: str) -> int:
+    path = _resolve_parquet_path()
+    if path.exists():
+        existing = pl.read_parquet(path)
+        merged = pl.concat(
+            [existing.filter(pl.col("symbol") != symbol), new_daily],
+            how="vertical_relaxed",
+        ).sort(["symbol", "date"])
+    else:
+        merged = new_daily.sort(["symbol", "date"])
+    _write_parquet_atomic(merged, path)
+    return new_daily.height
+
+
+def _upsert_pe(symbol: str, pe_value: float) -> None:
+    path = _pe_snapshot_path()
+    row = pl.DataFrame({"symbol": [symbol], "pe_ratio": [pe_value]})
+    if path.exists():
+        existing = pl.read_parquet(path)
+        merged = pl.concat(
+            [existing.filter(pl.col("symbol") != symbol), row],
+            how="vertical_relaxed",
+        )
+    else:
+        merged = row
+    _write_parquet_atomic(merged, path)
+
+
+def _upsert_name(symbol: str, name: str) -> None:
+    path = _stock_names_path()
+    row = pl.DataFrame({"symbol": [symbol], "name": [name]})
+    if path.exists():
+        existing = pl.read_parquet(path)
+        merged = pl.concat(
+            [existing.filter(pl.col("symbol") != symbol), row],
+            how="vertical_relaxed",
+        )
+    else:
+        merged = row
+    _write_parquet_atomic(merged, path)
+
+
+def ensure_symbol_cached(
+    symbol: str,
+    *,
+    days: int = 365,
+    adjust: str = "qfq",
+) -> dict[str, object]:
+    """按需把单只股票的 daily / PE / 名称增量写入三张 parquet 缓存。
+
+    用于 ``/score`` 单股路径冷命中时按需补齐——不重建全市场，只追加/覆盖这一只。
+
+    - 非股票池代码（北交所或非法）→ ``ValueError``
+    - ETF → ``ValueError``（评分管线不支持 ETF）
+    - daily 拉不到 → 上抛 ``RuntimeError``（多源 fallback 都失败）
+    - PE 拉不到 → 不致命，只落 daily/name；上层评分会因缺 PE 继续 404
+    """
+    code = _normalize_symbol(symbol)
+
+    if _is_etf_symbol(code):
+        raise ValueError(
+            f"Symbol '{code}' is an ETF, which is not supported by the scoring pipeline."
+        )
+    if not _is_stock_symbol(code):
+        raise ValueError(
+            f"Symbol '{code}' is not in the supported universe "
+            "(A-share main board / GEM / STAR; Beijing Stock Exchange excluded)."
+        )
+    if ak is None:
+        raise ModuleNotFoundError("akshare is not installed")
+
+    end_date_str = datetime.now().strftime("%Y%m%d")
+    start_date_str = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+
+    daily_pd = fetch_daily_one(code, start_date_str, end_date_str, adjust=adjust)
+    if daily_pd.empty:
+        raise RuntimeError(f"fetched daily is empty for {code}")
+    new_daily = pl.from_pandas(daily_pd)
+
+    try:
+        pe_value = _fetch_pe_one(code)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("pe fetch failed for %s: %s", code, exc)
+        pe_value = None
+
+    name = _fetch_single_stock_name(code)
+
+    with _CACHE_LOCK:
+        daily_rows = _upsert_daily(new_daily, code)
+        if pe_value is not None:
+            _upsert_pe(code, pe_value)
+        if name:
+            _upsert_name(code, name)
+
+    LOGGER.info(
+        "ensure_symbol_cached: %s -> daily=%d rows, pe=%s, name=%r",
+        code,
+        daily_rows,
+        pe_value,
+        name,
+    )
+
+    return {
+        "symbol": code,
+        "daily_rows": daily_rows,
+        "pe_ratio": pe_value,
+        "name": name,
+        "window": {"start": start_date_str, "end": end_date_str},
+    }
+
+
 def refresh_ashare_daily() -> dict[str, int | str]:
     """仅刷新日线 parquet（不触发 PE/名称刷新）。"""
     dataset = load_ashare_daily(refresh=True)

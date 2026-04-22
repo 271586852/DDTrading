@@ -17,11 +17,20 @@ class ScoreRequest(BaseModel):
     调用方有两种用法：
     1. 传 ``strategy_id`` 套用预设策略（此时三个 weight 会被该策略覆盖）。
     2. 不传 ``strategy_id``，直接传三个 weight 手动配比。
+
+    另外可选传 ``symbol``：
+    - 不传：全市场排行榜（默认 top 50）。
+    - 传：只返回该 symbol 在全市场 z-score 体系下的评分；若不在 parquet
+      缓存则后端抛 KeyError → 404；若为 ETF（无 PE）则抛 ValueError → 400。
     """
 
     strategy_id: Optional[str] = Field(
         default=None,
         description="可选的预设策略 id；若提供，会覆盖下面三个 weight。",
+    )
+    symbol: Optional[str] = Field(
+        default=None,
+        description="可选的单只代码；提供后只返回该 symbol 的评分（全市场 z-score 口径）。",
     )
     pe_weight: float = Field(default=0.3, description="Weight for PE ratio.")
     momentum_weight: float = Field(default=0.5, description="Weight for 20-day momentum.")
@@ -64,6 +73,10 @@ class ScoreResponse(BaseModel):
     normalized_weights: Dict[str, float]
     total_universe: int
     returned_count: int
+    mode: str = Field(
+        default="market",
+        description="'market' 表示全市场排行；'single' 表示单股评分（top_50 最多 1 条）。",
+    )
     top_50: List[RankedStock]
     applied_strategy: Optional[StrategyInfo] = Field(
         default=None,
@@ -123,4 +136,40 @@ class BacktestResponse(BaseModel):
     recent_positions: List[Dict[str, Any]] = Field(
         default_factory=list,
         description="最近 100 条持仓快照（时间倒序）。",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Quote (single-symbol price snapshot + recent candles)
+# ---------------------------------------------------------------------------
+
+
+class QuoteCandle(BaseModel):
+    date: Optional[str] = None
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
+    volume: Optional[float] = None
+
+
+class QuoteResponse(BaseModel):
+    """单只标的报价快照。"""
+
+    symbol: str
+    name: Optional[str] = None
+    kind: str = Field(
+        description="'stock' | 'etf' | 'unknown'，用于前端判断是否禁用评分按钮。",
+    )
+    latest_close: Optional[float] = None
+    prev_close: Optional[float] = None
+    change_pct: Optional[float] = Field(
+        default=None,
+        description="最近一日涨跌幅（百分比数值，如 -1.42 表示跌 1.42%）。",
+    )
+    as_of_date: Optional[str] = None
+    bars: int = 0
+    history: List[QuoteCandle] = Field(
+        default_factory=list,
+        description="按日期升序的最近若干根 K 线。",
     )

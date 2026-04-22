@@ -8,9 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.backtest import run_single_symbol_backtest
 from app.config import get_cors_origins
 from app.market_data import refresh_market_data
+from app.quotes import fetch_quote
 from app.schemas import (
     BacktestRequest,
     BacktestResponse,
+    QuoteResponse,
     ScoreRequest,
     ScoreResponse,
     StrategyInfo,
@@ -61,6 +63,11 @@ def calculate_scores(payload: ScoreRequest) -> ScoreResponse:
     try:
         result = score_stocks(payload)
     except KeyError as exc:
+        # 单股模式下 symbol 不在缓存 → 404；否则（unknown strategy_id）→ 400
+        status = 404 if payload.symbol else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    except ValueError as exc:
+        # 单股模式下命中 ETF → 400
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -68,6 +75,27 @@ def calculate_scores(payload: ScoreRequest) -> ScoreResponse:
         raise HTTPException(status_code=500, detail=f"Scoring failed: {exc}") from exc
 
     return ScoreResponse.model_validate(result)
+
+
+@app.get("/quote/{symbol}", response_model=QuoteResponse)
+def get_quote(symbol: str, bars: int = 120) -> QuoteResponse:
+    """返回单只标的的最近 ``bars`` 根 K 线 + 最新收盘价 / 涨跌幅。
+
+    数据来源：本地 parquet 缓存（``ashare_daily.parquet`` + ``stock_names.parquet``）。
+    若代码不在缓存中，返回 404，提示先调用 ``/refresh``。
+    """
+    try:
+        data = fetch_quote(symbol, bars=bars)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - defensive API boundary
+        raise HTTPException(status_code=500, detail=f"Quote lookup failed: {exc}") from exc
+
+    return QuoteResponse.model_validate(data)
 
 
 @app.post("/backtest", response_model=BacktestResponse)
