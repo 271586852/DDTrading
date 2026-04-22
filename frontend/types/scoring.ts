@@ -21,9 +21,54 @@ export type RankedStock = {
   };
 };
 
+export type StrategyInfo = {
+  id: string;
+  name: string;
+  description: string;
+  weights: FactorWeights;
+};
+
+export type ScoreMode = "market" | "single";
+
 export type ScoreResponse = {
   normalized_weights: FactorWeights;
   total_universe: number;
   returned_count: number;
+  mode: ScoreMode;
   top_50: RankedStock[];
+  applied_strategy?: StrategyInfo | null;
+};
+
+export type QuoteCandle = {
+  date: string | null;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  close: number | null;
+  volume: number | null;
+};
+
+export type SymbolKind = "stock" | "etf" | "unknown";
+
+export type QuoteResponse = {
+  symbol: string;
+  name: string | null;
+  kind: SymbolKind;
+  latest_close: number | null;
+  prev_close: number | null;
+  change_pct: number | null;
+  as_of_date: string | null;
+  bars: number;
+  history: QuoteCandle[];
+};
+
+export type HistoryEntry = {
+  id: string;
+  symbol: string;
+  name: string | null;
+  strategyId: string;
+  strategyName: string;
+  totalScore: number | null;
+  kind: SymbolKind;
+  analyzedAt: number;
 };
