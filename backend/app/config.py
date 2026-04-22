@@ -8,7 +8,13 @@ from typing import Literal
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_PATH = BACKEND_ROOT / "data" / "mock_data.parquet"
 DEFAULT_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "ashare_daily.parquet"
-DEFAULT_FRONTEND_ORIGIN = "http://127.0.0.1:3000"
+DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3001",
+    "http://localhost:3001",
+)
+DEFAULT_FRONTEND_ORIGIN = DEFAULT_FRONTEND_ORIGINS[0]
 DEFAULT_DATA_SOURCE: Literal["auto", "parquet", "akshare"] = "auto"
 DEFAULT_AKSHARE_UNIVERSE_SIZE = 300
 DEFAULT_AKSHARE_HISTORY_DAYS = 120
@@ -106,6 +112,8 @@ def get_daily_cache_ttl_hours() -> int:
 
 
 def get_cors_origins() -> list[str]:
-    raw_origins = os.getenv("DDTRADING_CORS_ORIGINS", DEFAULT_FRONTEND_ORIGIN)
+    raw_origins = os.getenv("DDTRADING_CORS_ORIGINS")
+    if not raw_origins:
+        return list(DEFAULT_FRONTEND_ORIGINS)
     origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
-    return origins or [DEFAULT_FRONTEND_ORIGIN]
+    return origins or list(DEFAULT_FRONTEND_ORIGINS)

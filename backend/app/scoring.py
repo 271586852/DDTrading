@@ -131,6 +131,32 @@ def _validate_dataset(dataset: pl.DataFrame, source_name: str) -> pl.DataFrame:
     return cleaned
 
 
+def _normalize_ticker_input(symbol: str) -> str:
+    """宽容地把 'sh600000' / '600000' / ' 600000 ' 统一成 6 位代码。"""
+    from app.market_data import _normalize_symbol
+
+    return _normalize_symbol(symbol)
+
+
+def _row_to_ranked(row: dict) -> dict:
+    return {
+        "rank": int(row["rank"]),
+        "ticker": row["ticker"],
+        "name": row["name"],
+        "total_score": float(row["total_score"]),
+        "factor_values": {
+            "pe_ratio": float(row["pe_ratio"]),
+            "momentum_20d": float(row["momentum_20d"]),
+            "volatility": float(row["volatility"]),
+        },
+        "factor_zscores": {
+            "pe_ratio": float(row["pe_ratio_zscore"]),
+            "momentum_20d": float(row["momentum_20d_zscore"]),
+            "volatility": float(row["volatility_zscore"]),
+        },
+    }
+
+
 def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
     raw_weights, applied_strategy = _raw_weights(payload)
     total_abs = sum(abs(v) for v in raw_weights.values())
@@ -151,37 +177,43 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
 
     scored = scored.with_columns(raw_score_expr.alias("raw_score"))
     scored = _scale_scores_to_100(scored, "raw_score")
-    scored = scored.sort("total_score", descending=True).head(top_n)
+    scored = scored.sort("total_score", descending=True)
     scored = scored.with_row_index(name="rank", offset=1)
 
-    top_50 = []
-    for row in scored.iter_rows(named=True):
-        top_50.append(
-            {
-                "rank": int(row["rank"]),
-                "ticker": row["ticker"],
-                "name": row["name"],
-                "total_score": float(row["total_score"]),
-                "factor_values": {
-                    "pe_ratio": float(row["pe_ratio"]),
-                    "momentum_20d": float(row["momentum_20d"]),
-                    "volatility": float(row["volatility"]),
-                },
-                "factor_zscores": {
-                    "pe_ratio": float(row["pe_ratio_zscore"]),
-                    "momentum_20d": float(row["momentum_20d_zscore"]),
-                    "volatility": float(row["volatility_zscore"]),
-                },
-            }
-        )
+    mode = "market"
+    target_symbol = (payload.symbol or "").strip()
+    if target_symbol:
+        mode = "single"
+        normalized = _normalize_ticker_input(target_symbol)
+
+        from app.market_data import _is_etf_symbol
+
+        if _is_etf_symbol(normalized):
+            raise ValueError(
+                f"Symbol '{normalized}' is an ETF, which is not supported by "
+                "the current scoring pipeline (no PE ratio)."
+            )
+
+        matched = scored.filter(pl.col("ticker") == normalized)
+        if matched.height == 0:
+            raise KeyError(
+                f"Symbol '{normalized}' is not present in the scoring dataset. "
+                "Please POST /refresh to rebuild the parquet cache first."
+            )
+        top_rows = matched.head(1)
+    else:
+        top_rows = scored.head(top_n)
+
+    rows_out = [_row_to_ranked(row) for row in top_rows.iter_rows(named=True)]
 
     result: Dict[str, object] = {
         "normalized_weights": {
             key: round(value, 4) for key, value in weights.items()
         },
         "total_universe": dataset.height,
-        "returned_count": len(top_50),
-        "top_50": top_50,
+        "returned_count": len(rows_out),
+        "mode": mode,
+        "top_50": rows_out,
     }
 
     if applied_strategy is not None:
