@@ -1,6 +1,7 @@
 "use client";
 
 import { History, Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import { useScoringStore } from "@/store/use-scoring-store";
 import type { HistoryEntry } from "@/types/scoring";
@@ -29,10 +30,16 @@ function scoreLabel(entry: HistoryEntry): string {
 }
 
 export function HistoryList() {
+  const [hydrated, setHydrated] = useState(false);
   const history = useScoringStore((state) => state.history);
   const selected = useScoringStore((state) => state.selectedHistoryId);
   const restore = useScoringStore((state) => state.restoreHistory);
   const clear = useScoringStore((state) => state.clearHistory);
+  const visibleHistory = hydrated ? history : [];
+
+  useEffect(() => {
+    setHydrated(true);
+  }, []);
 
   return (
     <section className="glass-panel flex min-h-[280px] flex-1 flex-col rounded-[22px] p-5">
@@ -45,7 +52,7 @@ export function HistoryList() {
             历史记录
           </h2>
         </div>
-        {history.length > 0 && (
+        {visibleHistory.length > 0 && (
           <button
             type="button"
             onClick={clear}
@@ -57,13 +64,13 @@ export function HistoryList() {
         )}
       </header>
 
-      {history.length === 0 ? (
+      {visibleHistory.length === 0 ? (
         <div className="flex flex-1 items-center justify-center rounded-xl border border-dashed border-white/5 bg-slate-950/30 text-xs text-slate-500">
           暂无分析记录
         </div>
       ) : (
         <ul className="flex flex-col gap-2 overflow-y-auto pr-1">
-          {history.map((entry) => {
+          {visibleHistory.map((entry) => {
             const isActive = entry.id === selected;
             return (
               <li key={entry.id}>
