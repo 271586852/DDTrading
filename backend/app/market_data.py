@@ -1,11 +1,11 @@
-"""全市场 A 股日线数据层。
+"""A 股股票 + ETF 日线数据层。
 
 职责：
 1. 在 import akshare 之前完成网络预处理（清代理环境变量 + 覆盖 requests.Session
    为 `trust_env=False` 且带浏览器请求头），避免 akshare 内部会话继承到不可用的
    系统代理。
 2. 提供多源 fallback 的单只日线获取：tencent -> sina -> eastmoney。
-3. 过滤 A 股股票池：沪深主板 + 创业板 + 科创板，排除北交所。
+3. 维护股票池：沪深主板 + 创业板 + 科创板 + A 股 ETF，排除北交所。
 4. 把全市场日线落到 parquet，并做 TTL/原子写盘。
 5. 额外维护两张轻量面板：股票名称快照 `stock_names.parquet`，PE 快照
    `pe_snapshot.parquet`（东财 ``stock_value_em`` 估值分析最新一行，优先
@@ -34,8 +34,8 @@ LOGGER = logging.getLogger(__name__)
 
 REQUIRED_COLS = ["date", "open", "high", "low", "close", "volume", "symbol"]
 
-# 沪深主板 / 中小板 / 创业板 / 科创板 的代码前缀，排除北交所（4/8/9 开头）。
-UNIVERSE_PREFIXES: tuple[str, ...] = (
+# 沪深主板 / 中小板 / 创业板 / 科创板 的股票代码前缀，排除北交所。
+STOCK_UNIVERSE_PREFIXES: tuple[str, ...] = (
     "60",   # 沪市主板
     "688",  # 科创板
     "000",  # 深市主板
@@ -44,6 +44,18 @@ UNIVERSE_PREFIXES: tuple[str, ...] = (
     "003",  # 深市主板
     "300",  # 创业板
     "301",  # 创业板
+)
+
+# A 股场内 ETF 常见前缀。真正的 ETF 名单仍以新浪 ETF 列表接口为准；
+# 这里主要用于判断 symbol 类型，以及为新浪/腾讯日线接口补齐市场前缀。
+ETF_PREFIXES: tuple[str, ...] = (
+    "15",
+    "16",
+    "50",
+    "51",
+    "52",
+    "56",
+    "58",
 )
 
 
@@ -109,22 +121,81 @@ except ImportError:  # pragma: no cover - optional dependency guard
 # ---------------------------------------------------------------------------
 
 
+def _normalize_symbol(symbol: str) -> str:
+    """把 ``sh600000`` / ``sz159998`` / ``600000`` 统一转成 6 位代码。"""
+    text = str(symbol).strip().lower()
+    for prefix in ("sh", "sz", "bj"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits:
+        raise ValueError(f"invalid symbol: {symbol!r}")
+    return digits[-6:].zfill(6)
+
+
+def _is_stock_symbol(symbol: str) -> bool:
+    code = _normalize_symbol(symbol)
+    return code.startswith(STOCK_UNIVERSE_PREFIXES)
+
+
+def _is_etf_symbol(symbol: str) -> bool:
+    code = _normalize_symbol(symbol)
+    return code.startswith(ETF_PREFIXES)
+
+
 def _with_market_prefix(symbol: str) -> str:
     """为新浪/腾讯接口补齐 ``sh/sz/bj`` 市场前缀。"""
-    code = symbol.zfill(6)
-    if code.startswith(("5", "6", "9", "11", "13")):
+    code = _normalize_symbol(symbol)
+    if code.startswith(("11", "13")):
         return f"sh{code}"
-    if code.startswith(("0", "2", "3")):
+    if code.startswith(("0", "1", "2", "3")):
         return f"sz{code}"
+    if code.startswith(("5", "6", "9")):
+        return f"sh{code}"
     if code.startswith(("4", "8")):
         return f"bj{code}"
     return f"sh{code}"
 
 
 def is_in_universe(symbol: str) -> bool:
-    """判断代码是否属于沪深主板/创业板/科创板。"""
-    code = symbol.zfill(6)
-    return code.startswith(UNIVERSE_PREFIXES)
+    """判断代码是否属于股票池（股票或 A 股 ETF）。"""
+    return _is_stock_symbol(symbol) or _is_etf_symbol(symbol)
+
+
+def _frame_from_code_name(
+    raw: pd.DataFrame,
+    *,
+    code_col: str,
+    name_col: str,
+) -> pd.DataFrame:
+    return (
+        pd.DataFrame(
+            {
+                "symbol": raw[code_col].astype(str).map(_normalize_symbol),
+                "name": raw[name_col].astype(str).str.strip(),
+            }
+        )
+        .dropna(subset=["symbol", "name"])
+        .reset_index(drop=True)
+    )
+
+
+def _fetch_sina_stock_snapshot() -> pd.DataFrame:
+    raw = ak.stock_zh_a_spot()
+    code_col = "代码" if "代码" in raw.columns else "code"
+    name_col = "名称" if "名称" in raw.columns else "name"
+    frame = _frame_from_code_name(raw, code_col=code_col, name_col=name_col)
+    return frame.loc[frame["symbol"].map(_is_stock_symbol)].reset_index(drop=True)
+
+
+def _fetch_sina_etf_snapshot() -> pd.DataFrame:
+    raw = ak.fund_etf_category_sina(symbol="ETF基金")
+    code_col = "代码" if "代码" in raw.columns else raw.columns[0]
+    name_col = "名称" if "名称" in raw.columns else raw.columns[1]
+    frame = _frame_from_code_name(raw, code_col=code_col, name_col=name_col)
+    return frame.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +221,7 @@ def _normalize(
     for col in ("open", "high", "low", "close", "volume"):
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    out["symbol"] = symbol.zfill(6)
+    out["symbol"] = _normalize_symbol(symbol)
     out = (
         out.dropna(subset=["open", "high", "low", "close"])
         .sort_values("date")
@@ -278,17 +349,19 @@ def fetch_daily_one(
 
 
 def list_universe() -> list[str]:
-    """获取沪深主板 / 创业板 / 科创板的 6 位代码列表（排除北交所）。"""
+    """获取股票池代码列表：A 股股票 + A 股场内 ETF。"""
     if ak is None:
         raise ModuleNotFoundError("akshare is not installed")
 
-    frame = ak.stock_info_a_code_name()
-    code_col = "code" if "code" in frame.columns else frame.columns[0]
-    codes = frame[code_col].astype(str).str.zfill(6)
-    mask = pd.Series(False, index=codes.index)
-    for prefix in UNIVERSE_PREFIXES:
-        mask = mask | codes.str.startswith(prefix)
-    return codes[mask].tolist()
+    stocks = _fetch_sina_stock_snapshot()
+    etfs = _fetch_sina_etf_snapshot()
+    merged = (
+        pd.concat([stocks[["symbol"]], etfs[["symbol"]]], ignore_index=True)
+        .drop_duplicates(subset=["symbol"])
+        .sort_values("symbol")
+        .reset_index(drop=True)
+    )
+    return merged["symbol"].tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +458,7 @@ def _build_daily_dataset(
 
 
 def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
-    """加载全市场 A 股日线；必要时联网重建并写 parquet。"""
+    """加载股票池日线（A 股股票 + ETF）；必要时联网重建并写 parquet。"""
     from app.config import (
         get_akshare_max_workers,
         get_daily_cache_ttl_hours,
@@ -441,32 +514,46 @@ def _to_float(value) -> float | None:
 
 
 def _fetch_stock_names_primary() -> pd.DataFrame:
-    raw = ak.stock_info_a_code_name()
-    code_col = "code" if "code" in raw.columns else raw.columns[0]
-    name_col = "name" if "name" in raw.columns else raw.columns[1]
-    return pd.DataFrame(
-        {
-            "symbol": raw[code_col].astype(str).str.zfill(6).values,
-            "name": raw[name_col].astype(str).str.strip().values,
-        }
+    stocks = _fetch_sina_stock_snapshot()
+    etfs = _fetch_sina_etf_snapshot()
+    return (
+        pd.concat([stocks, etfs], ignore_index=True)
+        .drop_duplicates(subset=["symbol"])
+        .reset_index(drop=True)
     )
 
 
 def _fetch_stock_names_fallback() -> pd.DataFrame:
-    """退路：用东财快照 ``stock_zh_a_spot_em`` 提取代码/名称。"""
-    raw = ak.stock_zh_a_spot_em()
-    code_col = "\u4ee3\u7801" if "\u4ee3\u7801" in raw.columns else "code"
-    name_col = "\u540d\u79f0" if "\u540d\u79f0" in raw.columns else "name"
-    return pd.DataFrame(
-        {
-            "symbol": raw[code_col].astype(str).str.zfill(6).values,
-            "name": raw[name_col].astype(str).str.strip().values,
-        }
+    """退路：东财 A 股快照 + 新浪 ETF 列表。"""
+    frames: list[pd.DataFrame] = []
+    last_exc: Exception | None = None
+
+    try:
+        raw = ak.stock_zh_a_spot_em()
+        code_col = "\u4ee3\u7801" if "\u4ee3\u7801" in raw.columns else "code"
+        name_col = "\u540d\u79f0" if "\u540d\u79f0" in raw.columns else "name"
+        stocks = _frame_from_code_name(raw, code_col=code_col, name_col=name_col)
+        frames.append(stocks.loc[stocks["symbol"].map(_is_stock_symbol)])
+    except Exception as exc:  # noqa: BLE001
+        last_exc = exc
+
+    try:
+        frames.append(_fetch_sina_etf_snapshot())
+    except Exception as exc:  # noqa: BLE001
+        last_exc = exc
+
+    if not frames:
+        raise RuntimeError(f"all fallback stock_names loaders failed: {last_exc!r}")
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(subset=["symbol"])
+        .reset_index(drop=True)
     )
 
 
 def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
-    """加载 ``symbol / name`` 快照（过滤到股票池内）。"""
+    """加载 ``symbol / name`` 快照（股票池 = 股票 + ETF）。"""
     from app.config import get_daily_cache_ttl_hours
 
     path = _stock_names_path()
@@ -498,14 +585,8 @@ def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
                 return pl.read_parquet(path)
             raise RuntimeError(f"all stock_names loaders failed: {last_exc!r}")
 
-        codes = frame["symbol"].astype(str)
-        mask = pd.Series(False, index=codes.index)
-        for prefix in UNIVERSE_PREFIXES:
-            mask = mask | codes.str.startswith(prefix)
-
         filtered = (
-            frame.loc[mask]
-            .drop_duplicates(subset=["symbol"])
+            frame.drop_duplicates(subset=["symbol"])
             .reset_index(drop=True)
         )
 
@@ -540,7 +621,8 @@ def _build_pe_snapshot(
     if ak is None:
         raise ModuleNotFoundError("akshare is not installed")
 
-    tickers = universe if universe is not None else list_universe()
+    source = universe if universe is not None else list_universe()
+    tickers = [sym for sym in source if _is_stock_symbol(sym)]
     if not tickers:
         raise RuntimeError("empty universe — cannot build pe snapshot")
 
