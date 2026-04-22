@@ -109,8 +109,11 @@ def _load_dataset_from_parquet() -> pl.DataFrame:
 def _load_dataset_from_akshare() -> pl.DataFrame:
     from app.akshare_loader import load_akshare_dataset
 
+    # universe_size=0 → 不做字典序截断，全市场进评分。
+    # 历史上这里是用来限流网络请求的，现在数据源是 parquet，截断只会
+    # 让靠后字典序（如 6xx/688 科创板）永远进不了排行榜。
     dataset = load_akshare_dataset(
-        universe_size=get_akshare_universe_size(),
+        universe_size=0,
         history_days=get_akshare_history_days(),
         max_workers=get_akshare_max_workers(),
         cache_ttl_seconds=get_akshare_cache_ttl_seconds(),
@@ -157,6 +160,22 @@ def _row_to_ranked(row: dict) -> dict:
     }
 
 
+def _rank_dataset(dataset: pl.DataFrame, weights: Dict[str, float]) -> pl.DataFrame:
+    """对一张宽表做 zscore → 加权和 → 归一化到 0~100 → 排名。"""
+    scored = dataset.with_columns(
+        [_safe_zscore_expr(column_name) for column_name in FACTOR_COLUMNS.values()]
+    )
+    raw_score_expr = sum(
+        pl.col(f"{column_name}_zscore") * weights[weight_name]
+        for weight_name, column_name in FACTOR_COLUMNS.items()
+    )
+    scored = scored.with_columns(raw_score_expr.alias("raw_score"))
+    scored = _scale_scores_to_100(scored, "raw_score")
+    scored = scored.sort("total_score", descending=True)
+    scored = scored.with_row_index(name="rank", offset=1)
+    return scored
+
+
 def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
     raw_weights, applied_strategy = _raw_weights(payload)
     total_abs = sum(abs(v) for v in raw_weights.values())
@@ -164,29 +183,18 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
         key: (value / total_abs if total_abs else 0.0)
         for key, value in raw_weights.items()
     }
+
     dataset = load_dataset()
-
-    scored = dataset.with_columns(
-        [_safe_zscore_expr(column_name) for column_name in FACTOR_COLUMNS.values()]
-    )
-
-    raw_score_expr = sum(
-        pl.col(f"{column_name}_zscore") * weights[weight_name]
-        for weight_name, column_name in FACTOR_COLUMNS.items()
-    )
-
-    scored = scored.with_columns(raw_score_expr.alias("raw_score"))
-    scored = _scale_scores_to_100(scored, "raw_score")
-    scored = scored.sort("total_score", descending=True)
-    scored = scored.with_row_index(name="rank", offset=1)
+    scored = _rank_dataset(dataset, weights)
 
     mode = "market"
+    on_demand_ensured: dict | None = None
     target_symbol = (payload.symbol or "").strip()
     if target_symbol:
         mode = "single"
         normalized = _normalize_ticker_input(target_symbol)
 
-        from app.market_data import _is_etf_symbol
+        from app.market_data import _is_etf_symbol, ensure_symbol_cached
 
         if _is_etf_symbol(normalized):
             raise ValueError(
@@ -196,10 +204,35 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
 
         matched = scored.filter(pl.col("ticker") == normalized)
         if matched.height == 0:
-            raise KeyError(
-                f"Symbol '{normalized}' is not present in the scoring dataset. "
-                "Please POST /refresh to rebuild the parquet cache first."
+            LOGGER.info(
+                "symbol %s miss in scoring dataset; trying on-demand cache fill",
+                normalized,
             )
+            try:
+                on_demand_ensured = ensure_symbol_cached(normalized)
+            except ValueError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise KeyError(
+                    f"Symbol '{normalized}' is not cached and on-demand fetch "
+                    f"failed: {exc}"
+                ) from exc
+
+            dataset = load_dataset()
+            scored = _rank_dataset(dataset, weights)
+            matched = scored.filter(pl.col("ticker") == normalized)
+            if matched.height == 0:
+                missing = []
+                if (on_demand_ensured or {}).get("pe_ratio") is None:
+                    missing.append("PE(东财估值分析暂无数据)")
+                if (on_demand_ensured or {}).get("daily_rows", 0) < 21:
+                    missing.append("历史日线不足 21 根")
+                detail = "; ".join(missing) or "资料仍不完整"
+                raise KeyError(
+                    f"Symbol '{normalized}' fetched on demand but scoring still "
+                    f"missing data ({detail})."
+                )
+
         top_rows = matched.head(1)
     else:
         top_rows = scored.head(top_n)
@@ -215,6 +248,14 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
         "mode": mode,
         "top_50": rows_out,
     }
+
+    if on_demand_ensured is not None:
+        result["on_demand_cached"] = {
+            "symbol": on_demand_ensured["symbol"],
+            "daily_rows": on_demand_ensured["daily_rows"],
+            "pe_ratio": on_demand_ensured["pe_ratio"],
+            "name": on_demand_ensured["name"],
+        }
 
     if applied_strategy is not None:
         result["applied_strategy"] = {
