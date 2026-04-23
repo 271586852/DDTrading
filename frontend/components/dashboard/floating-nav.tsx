@@ -1,6 +1,7 @@
 "use client";
 
-import { BarChart3, Home, Settings } from "lucide-react";
+import { BarChart3, LineChart, Settings } from "lucide-react";
+import { usePathname, useRouter } from "next/navigation";
 import {
   useEffect,
   useRef,
@@ -11,15 +12,18 @@ import {
 
 import { SettingsDialog } from "@/components/dashboard/settings-dialog";
 
+type NavItemId = "analysis" | "backtest" | "settings";
+
 type NavItem = {
-  id: "analysis" | "home" | "settings";
+  id: NavItemId;
   label: string;
   icon: typeof BarChart3;
+  href?: string;
 };
 
 const ITEMS: NavItem[] = [
-  { id: "analysis", label: "分析", icon: BarChart3 },
-  { id: "home", label: "首页", icon: Home },
+  { id: "analysis", label: "分析", icon: BarChart3, href: "/" },
+  { id: "backtest", label: "回测", icon: LineChart, href: "/backtest" },
   { id: "settings", label: "设置", icon: Settings },
 ];
 
@@ -33,8 +37,16 @@ type Position = {
 
 const DEFAULT_POSITION: Position = { x: 16, y: 545 };
 
+function deriveActive(pathname: string | null): NavItemId {
+  if (pathname?.startsWith("/backtest")) return "backtest";
+  return "analysis";
+}
+
 export function FloatingNav() {
-  const [active, setActive] = useState<NavItem["id"]>("analysis");
+  const router = useRouter();
+  const pathname = usePathname();
+  const active: NavItemId = deriveActive(pathname);
+
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [position, setPosition] = useState<Position>(DEFAULT_POSITION);
   const [dragging, setDragging] = useState(false);
@@ -142,7 +154,7 @@ export function FloatingNav() {
 
   const handleItemClick = (
     event: ReactMouseEvent<HTMLButtonElement>,
-    id: NavItem["id"],
+    item: NavItem,
   ) => {
     // 若刚发生拖拽，则阻断按钮点击，避免拖动后误切换 tab。
     if (movedRef.current) {
@@ -150,9 +162,12 @@ export function FloatingNav() {
       event.stopPropagation();
       return;
     }
-    setActive(id);
-    if (id === "settings") {
+    if (item.id === "settings") {
       setSettingsOpen(true);
+      return;
+    }
+    if (item.href && pathname !== item.href) {
+      router.push(item.href);
     }
   };
 
@@ -176,12 +191,13 @@ export function FloatingNav() {
         >
           {ITEMS.map((item) => {
             const Icon = item.icon;
-            const isActive = item.id === active;
+            const isActive =
+              item.id === "settings" ? settingsOpen : item.id === active;
             return (
               <button
                 key={item.id}
                 type="button"
-                onClick={(event) => handleItemClick(event, item.id)}
+                onClick={(event) => handleItemClick(event, item)}
                 aria-label={item.label}
                 aria-pressed={isActive}
                 className={

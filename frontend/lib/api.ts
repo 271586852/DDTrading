@@ -1,4 +1,9 @@
 import type {
+  BacktestRequest,
+  BacktestResponse,
+  TradeStrategyInfo,
+} from "@/types/backtest";
+import type {
   QuoteResponse,
   RefreshMode,
   RefreshResponse,
@@ -80,6 +85,19 @@ export function refreshMarketData(
   const qs = new URLSearchParams({ mode }).toString();
   return request<RefreshResponse>(`/refresh?${qs}`, {
     method: "POST",
+  });
+}
+
+export function listTradeStrategies(): Promise<TradeStrategyInfo[]> {
+  return request<TradeStrategyInfo[]>("/trade-strategies");
+}
+
+export function runBacktest(
+  payload: BacktestRequest,
+): Promise<BacktestResponse> {
+  return request<BacktestResponse>("/backtest", {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
 }
 
