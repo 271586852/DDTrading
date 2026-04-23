@@ -7,7 +7,7 @@ param(
     [int]$AkshareHistoryDays = 120,
     [int]$AkshareMaxWorkers = 8,
     [int]$AkshareCacheTtlSeconds = 600,
-    [string]$CorsOrigins = "http://127.0.0.1:3000"
+    [string]$CorsOrigins = "http://127.0.0.1:3000,http://localhost:3000"
 )
 
 $ErrorActionPreference = "Stop"
