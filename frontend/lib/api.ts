@@ -1,5 +1,6 @@
 import type {
   BacktestRequest,
+  BacktestReportRequest,
   BacktestResponse,
   TradeStrategyInfo,
 } from "@/types/backtest";
@@ -99,6 +100,21 @@ export function runBacktest(
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export async function exportBacktestReport(
+  payload: BacktestReportRequest,
+): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/backtest/report`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const message = await parseError(response);
+    throw new ApiError(message, response.status);
+  }
+  return response.blob();
 }
 
 const STOCK_PREFIXES = [

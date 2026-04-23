@@ -5,6 +5,7 @@ import { LineChart } from "lucide-react";
 import { BacktestChart } from "@/components/backtest/backtest-chart";
 import { BacktestForm } from "@/components/backtest/backtest-form";
 import { BacktestMetrics } from "@/components/backtest/backtest-metrics";
+import { BacktestPositionsTable } from "@/components/backtest/backtest-positions-table";
 import { BacktestTradesTable } from "@/components/backtest/backtest-trades-table";
 import { FloatingNav } from "@/components/dashboard/floating-nav";
 import { useBacktestStore } from "@/store/use-backtest-store";
@@ -46,6 +47,7 @@ export default function BacktestPage() {
                 <BacktestMetrics result={result} />
                 <BacktestChart result={result} />
                 <BacktestTradesTable result={result} />
+                <BacktestPositionsTable result={result} />
               </>
             )}
           </section>

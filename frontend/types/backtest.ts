@@ -46,6 +46,11 @@ export type BacktestRequest = {
   strategy_id?: string | null;
 };
 
+export type BacktestReportRequest = BacktestRequest & {
+  title?: string | null;
+  curve_freq?: "raw" | "D";
+};
+
 export type BacktestResponse = {
   symbol: string;
   requested_range: BacktestDateRange;
@@ -58,4 +63,5 @@ export type BacktestResponse = {
   trade_markers: TradeMarker[];
   recent_trades: Record<string, unknown>[];
   recent_positions: Record<string, unknown>[];
+  daily_positions: Record<string, unknown>[];
 };

@@ -1,6 +1,14 @@
 "use client";
 
-import { Calendar, Coins, Hash, Loader2, Play, Sparkles } from "lucide-react";
+import {
+  Calendar,
+  Coins,
+  Download,
+  Hash,
+  Loader2,
+  Play,
+  Sparkles,
+} from "lucide-react";
 import { useEffect } from "react";
 
 import { useBacktestStore } from "@/store/use-backtest-store";
@@ -12,6 +20,7 @@ export function BacktestForm() {
   const strategiesError = useBacktestStore((s) => s.strategiesError);
   const loadStrategies = useBacktestStore((s) => s.loadStrategies);
   const run = useBacktestStore((s) => s.runBacktest);
+  const exportReport = useBacktestStore((s) => s.exportReport);
   const isRunning = useBacktestStore((s) => s.isRunning);
   const error = useBacktestStore((s) => s.error);
 
@@ -139,24 +148,35 @@ export function BacktestForm() {
         </p>
       )}
 
-      <button
-        type="button"
-        onClick={() => void run()}
-        disabled={isRunning}
-        className={
-          "inline-flex h-12 items-center justify-center gap-2 rounded-2xl px-6 text-sm font-medium tracking-wide transition-all " +
-          "bg-gradient-to-r from-cyan-500/90 via-cyan-400/90 to-sky-400/90 text-slate-950 shadow-[0_0_28px_rgba(56,189,248,0.35)] " +
-          "hover:shadow-[0_0_34px_rgba(56,189,248,0.55)] " +
-          "disabled:opacity-50 disabled:shadow-none disabled:cursor-not-allowed"
-        }
-      >
-        {isRunning ? (
-          <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.8} />
-        ) : (
-          <Play className="h-4 w-4" strokeWidth={1.8} />
-        )}
-        {isRunning ? "回测中…" : "运行回测"}
-      </button>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <button
+          type="button"
+          onClick={() => void run()}
+          disabled={isRunning}
+          className={
+            "inline-flex h-12 items-center justify-center gap-2 rounded-2xl px-6 text-sm font-medium tracking-wide transition-all " +
+            "bg-gradient-to-r from-cyan-500/90 via-cyan-400/90 to-sky-400/90 text-slate-950 shadow-[0_0_28px_rgba(56,189,248,0.35)] " +
+            "hover:shadow-[0_0_34px_rgba(56,189,248,0.55)] " +
+            "disabled:opacity-50 disabled:shadow-none disabled:cursor-not-allowed"
+          }
+        >
+          {isRunning ? (
+            <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.8} />
+          ) : (
+            <Play className="h-4 w-4" strokeWidth={1.8} />
+          )}
+          {isRunning ? "回测中…" : "运行回测"}
+        </button>
+        <button
+          type="button"
+          onClick={() => void exportReport("D")}
+          disabled={isRunning}
+          className="inline-flex h-12 items-center justify-center gap-2 rounded-2xl border border-cyan-400/35 bg-cyan-500/10 px-6 text-sm font-medium tracking-wide text-cyan-100 transition-all hover:border-cyan-300/55 hover:bg-cyan-400/15 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <Download className="h-4 w-4" strokeWidth={1.8} />
+          导出 HTML 报告
+        </button>
+      </div>
     </section>
   );
 }

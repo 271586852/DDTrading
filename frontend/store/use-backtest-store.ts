@@ -4,6 +4,7 @@ import { create } from "zustand";
 
 import {
   ApiError,
+  exportBacktestReport,
   listTradeStrategies,
   normalizeSymbol,
   runBacktest,
@@ -32,6 +33,7 @@ type BacktestStore = {
   loadStrategies: () => Promise<void>;
   setForm: (patch: Partial<FormState>) => void;
   runBacktest: () => Promise<void>;
+  exportReport: (curveFreq?: "raw" | "D") => Promise<void>;
   resetResult: () => void;
 };
 
@@ -150,6 +152,60 @@ export const useBacktestStore = create<BacktestStore>((set, get) => ({
         error: message,
         result: null,
       }));
+    }
+  },
+
+  exportReport: async (curveFreq = "D") => {
+    const { form } = get();
+    if (!form.symbol.trim()) {
+      set((state) => ({ ...state, error: "请输入股票代码后再导出报告" }));
+      return;
+    }
+    let normalizedSymbol: string;
+    try {
+      normalizedSymbol = normalizeSymbol(form.symbol);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "代码格式不正确";
+      set((state) => ({ ...state, error: message }));
+      return;
+    }
+    if (!form.startDate || !form.endDate || form.endDate < form.startDate) {
+      set((state) => ({ ...state, error: "请先选择有效的起止日期" }));
+      return;
+    }
+    if (!(form.initialCash > 0)) {
+      set((state) => ({ ...state, error: "初始资金需大于 0" }));
+      return;
+    }
+    set((state) => ({ ...state, error: null }));
+    try {
+      const blob = await exportBacktestReport({
+        symbol: normalizedSymbol,
+        start_date: form.startDate,
+        end_date: form.endDate,
+        initial_cash: form.initialCash,
+        strategy_id: form.strategyId,
+        curve_freq: curveFreq,
+      });
+      const fileName = `backtest_${normalizedSymbol}_${form.startDate}_${form.endDate}.html`;
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = fileName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      let message: string;
+      if (err instanceof ApiError) {
+        message = err.message;
+      } else if (err instanceof Error) {
+        message = err.message;
+      } else {
+        message = "导出回测报告失败";
+      }
+      set((state) => ({ ...state, error: message }));
     }
   },
 
