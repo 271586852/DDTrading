@@ -16,9 +16,11 @@ from app.schemas import (
     ScoreRequest,
     ScoreResponse,
     StrategyInfo,
+    TradeStrategyInfo,
 )
 from app.scoring import score_stocks
 from app.strategies import list_strategies
+from app.trade_strategies import list_trade_strategies
 
 
 app = FastAPI(
@@ -96,6 +98,15 @@ def get_quote(symbol: str, bars: int = 120) -> QuoteResponse:
         raise HTTPException(status_code=500, detail=f"Quote lookup failed: {exc}") from exc
 
     return QuoteResponse.model_validate(data)
+
+
+@app.get("/trade-strategies", response_model=List[TradeStrategyInfo])
+def get_trade_strategies() -> List[TradeStrategyInfo]:
+    """列出所有可用于 ``/backtest`` 的交易策略。"""
+    return [
+        TradeStrategyInfo(id=spec.id, name=spec.name, description=spec.description)
+        for spec in list_trade_strategies()
+    ]
 
 
 @app.post("/backtest", response_model=BacktestResponse)
