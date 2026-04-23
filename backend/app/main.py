@@ -2,15 +2,16 @@ from __future__ import annotations
 
 from typing import List, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.backtest import run_single_symbol_backtest
+from app.backtest import export_single_symbol_backtest_report, run_single_symbol_backtest
 from app.config import get_cors_origins
 from app.market_data import refresh_market_data
 from app.quotes import fetch_quote
 from app.schemas import (
     BacktestRequest,
+    BacktestReportRequest,
     BacktestResponse,
     QuoteResponse,
     ScoreRequest,
@@ -120,6 +121,29 @@ def run_backtest_endpoint(payload: BacktestRequest) -> BacktestResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive API boundary
         raise HTTPException(status_code=500, detail=f"Backtest failed: {exc}") from exc
+
+
+@app.post("/backtest/report")
+def export_backtest_report_endpoint(payload: BacktestReportRequest) -> Response:
+    """导出单只股票回测 HTML 报告。"""
+    try:
+        html = export_single_symbol_backtest_report(payload)
+        filename = f"backtest_{payload.symbol.zfill(6)}_{payload.start_date}_{payload.end_date}.html"
+        return Response(
+            content=html,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - defensive API boundary
+        raise HTTPException(
+            status_code=500, detail=f"Backtest report export failed: {exc}"
+        ) from exc
 
 
 @app.post("/refresh")

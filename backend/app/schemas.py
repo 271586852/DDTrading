@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -108,6 +108,19 @@ class BacktestRequest(BaseModel):
         return self
 
 
+class BacktestReportRequest(BacktestRequest):
+    """回测 HTML 报告导出请求体。"""
+
+    title: Optional[str] = Field(
+        default=None,
+        description="可选的报告标题；不传则由服务端自动生成。",
+    )
+    curve_freq: Literal["raw", "D"] = Field(
+        default="D",
+        description="报告曲线频率：raw 原始频率，D 为日频末值。",
+    )
+
+
 class BacktestDateRange(BaseModel):
     start: date
     end: date
@@ -191,6 +204,10 @@ class BacktestResponse(BaseModel):
     recent_positions: List[Dict[str, Any]] = Field(
         default_factory=list,
         description="最近 100 条持仓快照（时间倒序）。",
+    )
+    daily_positions: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="每日持仓详情（按时间升序，来自 BacktestResult.positions_df）。",
     )
 
 

@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import math
+import tempfile
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -23,6 +25,7 @@ from app.schemas import (
     BacktestDateRange,
     BacktestMetrics,
     BacktestRequest,
+    BacktestReportRequest,
     BacktestResponse,
     EquityPoint,
     PricePoint,
@@ -39,6 +42,7 @@ from app.trade_strategies import (
 LOGGER = logging.getLogger(__name__)
 
 MAX_DETAIL_ROWS = 100
+MAX_DAILY_POSITION_ROWS = 2000
 
 
 def _to_date(value: Any) -> date:
@@ -75,6 +79,22 @@ def _records(frame: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
     if frame is None or frame.empty:
         return []
     tail = frame.tail(limit).iloc[::-1]  # 倒序：最新在前
+    return [
+        {col: _sanitize_value(row[col]) for col in tail.columns}
+        for _, row in tail.iterrows()
+    ]
+
+
+def _records_asc(frame: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
+    """按时间升序取最近 N 行，便于展示每日持仓明细。"""
+    if frame is None or frame.empty:
+        return []
+    sorted_frame = frame
+    for col in ("date", "timestamp", "time"):
+        if col in frame.columns:
+            sorted_frame = frame.sort_values(col)
+            break
+    tail = sorted_frame.tail(limit)
     return [
         {col: _sanitize_value(row[col]) for col in tail.columns}
         for _, row in tail.iterrows()
@@ -323,4 +343,59 @@ def run_single_symbol_backtest(
         trade_markers=_trade_markers(trades_df),
         recent_trades=_records(trades_df, MAX_DETAIL_ROWS),
         recent_positions=_records(positions_df, MAX_DETAIL_ROWS),
+        daily_positions=_records_asc(positions_df, MAX_DAILY_POSITION_ROWS),
     )
+
+
+def export_single_symbol_backtest_report(
+    request: BacktestReportRequest,
+    *,
+    commission_rate: float = 0.0003,
+) -> str:
+    """执行回测并导出 HTML 报告内容。"""
+    from akquant import run_backtest
+
+    symbol = request.symbol.zfill(6)
+    data, start_eff, end_eff = _resolve_symbol_window(
+        symbol=symbol,
+        start_req=request.start_date,
+        end_req=request.end_date,
+    )
+    spec = _resolve_trade_strategy(request.strategy_id)
+    strategy_cls = spec.build_cls()
+
+    LOGGER.info(
+        "export report: symbol=%s strategy=%s range=[%s, %s] bars=%d cash=%.2f curve_freq=%s",
+        symbol,
+        spec.id,
+        start_eff,
+        end_eff,
+        len(data),
+        request.initial_cash,
+        request.curve_freq,
+    )
+
+    result = run_backtest(
+        strategy=strategy_cls,
+        data=data,
+        symbols=symbol,
+        initial_cash=request.initial_cash,
+        commission_rate=commission_rate,
+    )
+
+    default_title = (
+        f"{symbol} {spec.name} 回测报告 "
+        f"({start_eff.isoformat()} ~ {end_eff.isoformat()})"
+    )
+    report_title = request.title or default_title
+
+    with tempfile.TemporaryDirectory(prefix="ddtrading-report-") as tmpdir:
+        out_path = Path(tmpdir) / "backtest_report.html"
+        result.report(
+            title=report_title,
+            filename=str(out_path),
+            show=False,
+            compact_currency=True,
+            curve_freq=request.curve_freq,
+        )
+        return out_path.read_text(encoding="utf-8")
