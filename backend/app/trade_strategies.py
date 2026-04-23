@@ -7,6 +7,7 @@
 - ``flip_100``: 最简单的翻转策略——无仓买 100 股，有仓平仓 100 股。
 - ``sma_cross``: 5/20 SMA 金叉死叉，全仓买入/清仓卖出。
 - ``buy_hold``: 首根 bar 满仓买入后长持。
+- ``smoke_test``: 首根买入、次根卖出，之后不再交易（用于链路冒烟测试）。
 """
 from __future__ import annotations
 
@@ -111,7 +112,36 @@ def _build_buy_hold_cls() -> type:
     return _BuyHold
 
 
+def _build_smoke_test_cls() -> type:
+    from akquant import Strategy
+
+    class _SmokeTest(Strategy):
+        """首根买入 100 股，次根卖出 100 股，后续不再交易。"""
+
+        def on_start(self):  # type: ignore[no-untyped-def]
+            self._step = 0
+
+        def on_bar(self, bar):  # type: ignore[no-untyped-def]
+            if not hasattr(self, "_step"):
+                self._step = 0
+
+            if self._step == 0 and self.get_position(bar.symbol) == 0:
+                self.buy(symbol=bar.symbol, quantity=100)
+            elif self._step == 1 and self.get_position(bar.symbol) > 0:
+                self.sell(symbol=bar.symbol, quantity=100)
+
+            self._step += 1
+
+    return _SmokeTest
+
+
 _TRADE_STRATEGIES: tuple[TradeStrategySpec, ...] = (
+    TradeStrategySpec(
+        id="smoke_test",
+        name="冒烟测试（买一卖一）",
+        description="首根买入 100 股，次根卖出 100 股，后续不再交易；用于快速验证回测链路。",
+        build_cls=_build_smoke_test_cls,
+    ),
     TradeStrategySpec(
         id="flip_100",
         name="翻转 100 股",
