@@ -9,6 +9,8 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 
+import { SettingsDialog } from "@/components/dashboard/settings-dialog";
+
 type NavItem = {
   id: "analysis" | "home" | "settings";
   label: string;
@@ -33,29 +35,41 @@ const DEFAULT_POSITION: Position = { x: 16, y: 545 };
 
 export function FloatingNav() {
   const [active, setActive] = useState<NavItem["id"]>("analysis");
-  const [position, setPosition] = useState<Position>(() => {
-    if (typeof window === "undefined") {
-      return DEFAULT_POSITION;
-    }
-    const raw = window.localStorage.getItem(POSITION_STORAGE_KEY);
-    if (!raw) return DEFAULT_POSITION;
-    try {
-      const parsed = JSON.parse(raw) as Position;
-      if (Number.isFinite(parsed.x) && Number.isFinite(parsed.y)) {
-        return parsed;
-      }
-    } catch {
-      // ignore invalid localStorage payload
-    }
-    return DEFAULT_POSITION;
-  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [position, setPosition] = useState<Position>(DEFAULT_POSITION);
   const [dragging, setDragging] = useState(false);
   const navRef = useRef<HTMLElement | null>(null);
   const dragOffsetRef = useRef<Position>({ x: 0, y: 0 });
   const dragStartedAtRef = useRef<Position>({ x: 0, y: 0 });
   const movedRef = useRef(false);
+  const storageReadyRef = useRef(false);
+  const pointerIdRef = useRef<number | null>(null);
+  const pointerActiveRef = useRef(false);
 
   useEffect(() => {
+    let rafId = 0;
+    const raw = window.localStorage.getItem(POSITION_STORAGE_KEY);
+    if (!raw) {
+      storageReadyRef.current = true;
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as Position;
+      if (Number.isFinite(parsed.x) && Number.isFinite(parsed.y)) {
+        rafId = window.requestAnimationFrame(() => {
+          setPosition(parsed);
+          storageReadyRef.current = true;
+        });
+        return () => window.cancelAnimationFrame(rafId);
+      }
+    } catch {
+      // ignore invalid localStorage payload
+    }
+    storageReadyRef.current = true;
+  }, []);
+
+  useEffect(() => {
+    if (!storageReadyRef.current) return;
     window.localStorage.setItem(POSITION_STORAGE_KEY, JSON.stringify(position));
   }, [position]);
 
@@ -75,27 +89,34 @@ export function FloatingNav() {
   }, []);
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLElement>) => {
-    const el = navRef.current;
-    if (!el) return;
-    setDragging(true);
+    pointerActiveRef.current = true;
+    pointerIdRef.current = event.pointerId;
     movedRef.current = false;
     dragStartedAtRef.current = { x: event.clientX, y: event.clientY };
     dragOffsetRef.current = {
       x: event.clientX - position.x,
       y: event.clientY - position.y,
     };
-    el.setPointerCapture(event.pointerId);
   };
 
   const handlePointerMove = (event: ReactPointerEvent<HTMLElement>) => {
-    if (!dragging) return;
+    if (!pointerActiveRef.current || pointerIdRef.current !== event.pointerId) return;
     const el = navRef.current;
     if (!el) return;
 
     const dx = Math.abs(event.clientX - dragStartedAtRef.current.x);
     const dy = Math.abs(event.clientY - dragStartedAtRef.current.y);
-    if (dx > DRAG_THRESHOLD || dy > DRAG_THRESHOLD) {
+    const crossedThreshold = dx > DRAG_THRESHOLD || dy > DRAG_THRESHOLD;
+    if (!crossedThreshold && !dragging) {
+      return;
+    }
+
+    if (crossedThreshold) {
       movedRef.current = true;
+    }
+    if (!dragging) {
+      setDragging(true);
+      el.setPointerCapture(event.pointerId);
     }
 
     const maxX = Math.max(0, window.innerWidth - el.offsetWidth);
@@ -109,9 +130,11 @@ export function FloatingNav() {
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLElement>) => {
-    if (!dragging) return;
+    if (pointerIdRef.current !== event.pointerId) return;
+    pointerActiveRef.current = false;
+    pointerIdRef.current = null;
     const el = navRef.current;
-    if (el) {
+    if (dragging && el) {
       el.releasePointerCapture(event.pointerId);
     }
     setDragging(false);
@@ -128,56 +151,63 @@ export function FloatingNav() {
       return;
     }
     setActive(id);
+    if (id === "settings") {
+      setSettingsOpen(true);
+    }
   };
 
   return (
-    <nav
-      ref={navRef}
-      aria-label="主导航"
-      className="pointer-events-auto fixed z-30 hidden touch-none select-none lg:block"
-      style={{ left: position.x, top: position.y }}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerCancel={handlePointerUp}
-    >
-      <div
-        className={
-          "flex cursor-grab flex-col items-center gap-1 rounded-full border border-white/5 bg-slate-950/70 px-2 py-3 shadow-[0_20px_50px_rgba(2,6,23,0.6)] backdrop-blur-xl " +
-          (dragging ? "cursor-grabbing" : "")
-        }
+    <>
+      <nav
+        ref={navRef}
+        aria-label="主导航"
+        className="pointer-events-auto fixed z-30 hidden touch-none select-none lg:block"
+        style={{ left: position.x, top: position.y }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
       >
-        {ITEMS.map((item) => {
-          const Icon = item.icon;
-          const isActive = item.id === active;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              onClick={(event) => handleItemClick(event, item.id)}
-              aria-label={item.label}
-              aria-pressed={isActive}
-              className={
-                "group relative flex h-11 w-11 items-center justify-center rounded-full transition-all duration-200 " +
-                (isActive
-                  ? "bg-cyan-400/15 text-cyan-200 shadow-[0_0_18px_rgba(56,189,248,0.55)]"
-                  : "text-slate-400 hover:text-cyan-100 hover:bg-white/5")
-              }
-            >
-              <Icon
+        <div
+          className={
+            "flex cursor-grab flex-col items-center gap-1 rounded-full border border-white/5 bg-slate-950/70 px-2 py-3 shadow-[0_20px_50px_rgba(2,6,23,0.6)] backdrop-blur-xl " +
+            (dragging ? "cursor-grabbing" : "")
+          }
+        >
+          {ITEMS.map((item) => {
+            const Icon = item.icon;
+            const isActive = item.id === active;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={(event) => handleItemClick(event, item.id)}
+                aria-label={item.label}
+                aria-pressed={isActive}
                 className={
-                  "h-5 w-5 transition-transform duration-200 " +
-                  (isActive ? "scale-110" : "group-hover:scale-105")
+                  "group relative flex h-11 w-11 items-center justify-center rounded-full transition-all duration-200 " +
+                  (isActive
+                    ? "bg-cyan-400/15 text-cyan-200 shadow-[0_0_18px_rgba(56,189,248,0.55)]"
+                    : "text-slate-400 hover:text-cyan-100 hover:bg-white/5")
                 }
-                strokeWidth={1.6}
-              />
-              <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md border border-white/5 bg-slate-900/95 px-2 py-1 text-[11px] text-slate-300 opacity-0 shadow-lg transition-opacity duration-150 group-hover:opacity-100">
-                {item.label}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-    </nav>
+              >
+                <Icon
+                  className={
+                    "h-5 w-5 transition-transform duration-200 " +
+                    (isActive ? "scale-110" : "group-hover:scale-105")
+                  }
+                  strokeWidth={1.6}
+                />
+                <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md border border-white/5 bg-slate-900/95 px-2 py-1 text-[11px] text-slate-300 opacity-0 shadow-lg transition-opacity duration-150 group-hover:opacity-100">
+                  {item.label}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </nav>
+
+      <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+    </>
   );
 }

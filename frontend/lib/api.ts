@@ -1,5 +1,7 @@
 import type {
   QuoteResponse,
+  RefreshMode,
+  RefreshResponse,
   ScoreResponse,
   StrategyInfo,
 } from "@/types/scoring";
@@ -70,6 +72,15 @@ export function scoreSingle(
 export function fetchQuote(symbol: string, bars = 120): Promise<QuoteResponse> {
   const qs = new URLSearchParams({ bars: String(bars) }).toString();
   return request<QuoteResponse>(`/quote/${encodeURIComponent(symbol)}?${qs}`);
+}
+
+export function refreshMarketData(
+  mode: RefreshMode = "incremental",
+): Promise<RefreshResponse> {
+  const qs = new URLSearchParams({ mode }).toString();
+  return request<RefreshResponse>(`/refresh?${qs}`, {
+    method: "POST",
+  });
 }
 
 const STOCK_PREFIXES = [

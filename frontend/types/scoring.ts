@@ -72,3 +72,31 @@ export type HistoryEntry = {
   kind: SymbolKind;
   analyzedAt: number;
 };
+
+export type RefreshMode = "incremental" | "full";
+
+export type RefreshSectionSummary = {
+  path: string;
+  rows?: number;
+  rows_before?: number;
+  rows_after?: number;
+  rows_added?: number;
+  symbols?: number;
+  updated_symbols?: number;
+  failed_symbols?: number;
+  upserted_symbols?: number;
+  warning?: string;
+};
+
+export type RefreshSummary = {
+  mode: RefreshMode;
+  daily: RefreshSectionSummary;
+  names: RefreshSectionSummary;
+  pe: RefreshSectionSummary;
+};
+
+export type RefreshResponse = {
+  status: string;
+  mode: RefreshMode;
+  summary: RefreshSummary;
+};

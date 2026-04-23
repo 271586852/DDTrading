@@ -21,9 +21,9 @@ import os
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from typing import Callable, Iterable
 
 import pandas as pd
@@ -369,7 +369,7 @@ def list_universe() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-_CACHE_LOCK = Lock()
+_CACHE_LOCK = RLock()
 
 
 def _parquet_is_fresh(path: Path, ttl_hours: int) -> bool:
@@ -634,6 +634,7 @@ def _build_pe_snapshot(
 
     rows: list[dict[str, object]] = []
     failed = 0
+    updated_at = datetime.now().isoformat(timespec="seconds")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
             executor.submit(_fetch_pe_one, sym): sym for sym in tickers
@@ -648,7 +649,13 @@ def _build_pe_snapshot(
                 continue
             if pe_value is None:
                 continue
-            rows.append({"symbol": symbol, "pe_ratio": pe_value})
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "pe_ratio": pe_value,
+                    "updated_at": updated_at,
+                }
+            )
 
     if not rows:
         raise RuntimeError("no pe rows fetched successfully")
@@ -677,17 +684,259 @@ def load_pe_snapshot(*, refresh: bool = False) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# 增量刷新辅助函数
+# ---------------------------------------------------------------------------
+
+
+INCREMENTAL_OVERLAP_DAYS = 5
+
+
+def _merge_daily_frames(existing: pl.DataFrame, updates: pl.DataFrame) -> pl.DataFrame:
+    return (
+        pl.concat([existing, updates], how="vertical_relaxed")
+        .unique(subset=["symbol", "date"], keep="last")
+        .sort(["symbol", "date"])
+    )
+
+
+def _update_stock_names_incremental(universe: list[str]) -> tuple[pl.DataFrame, dict[str, object]]:
+    path = _stock_names_path()
+    rows_before = 0
+    if ak is None:
+        raise ModuleNotFoundError("akshare is not installed")
+
+    if path.exists():
+        existing = pl.read_parquet(path)
+        rows_before = existing.height
+    else:
+        existing = pl.DataFrame(schema={"symbol": pl.Utf8, "name": pl.Utf8})
+
+    last_exc: Exception | None = None
+    fresh_frame: pd.DataFrame | None = None
+    for loader in (_fetch_stock_names_primary, _fetch_stock_names_fallback):
+        try:
+            fresh_frame = loader()
+            break
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("stock_names loader %s failed during incremental refresh: %s", loader.__name__, exc)
+            last_exc = exc
+
+    if fresh_frame is None:
+        if path.exists():
+            return existing, {
+                "rows_before": rows_before,
+                "rows_after": existing.height,
+                "upserted_symbols": 0,
+                "path": str(path),
+                "warning": f"stock names refresh skipped: {last_exc!r}",
+            }
+        raise RuntimeError(f"all stock_names loaders failed: {last_exc!r}")
+
+    fresh = pl.from_pandas(fresh_frame).filter(pl.col("symbol").is_in(universe)).sort("symbol")
+    merged = (
+        pl.concat(
+            [
+                existing.filter(~pl.col("symbol").is_in(fresh.get_column("symbol"))),
+                fresh,
+            ],
+            how="vertical_relaxed",
+        )
+        .unique(subset=["symbol"], keep="last")
+        .sort("symbol")
+    )
+    _write_parquet_atomic(merged, path)
+    return merged, {
+        "rows_before": rows_before,
+        "rows_after": merged.height,
+        "upserted_symbols": fresh.height,
+        "path": str(path),
+    }
+
+
+def _build_pe_snapshot_incremental(
+    *,
+    max_workers: int,
+    universe: list[str],
+) -> tuple[pl.DataFrame, dict[str, object]]:
+    path = _pe_snapshot_path()
+    stock_universe = [symbol for symbol in universe if _is_stock_symbol(symbol)]
+    if not stock_universe:
+        raise RuntimeError("empty stock universe — cannot build incremental pe snapshot")
+
+    rows_before = 0
+    targets: list[str]
+    if path.exists():
+        existing = pl.read_parquet(path)
+        rows_before = existing.height
+        snapshot_cols = existing.columns
+        if "updated_at" in snapshot_cols:
+            stale_expr = (
+                pl.col("updated_at")
+                .str.strptime(pl.Datetime, strict=False)
+                .dt.date()
+                .fill_null(date(1970, 1, 1))
+            )
+            today = datetime.now().date()
+            stale_symbols = (
+                existing.filter(stale_expr < today)
+                .get_column("symbol")
+                .unique()
+                .to_list()
+            )
+        else:
+            stale_symbols = existing.get_column("symbol").unique().to_list()
+        existing_symbols = set(existing.get_column("symbol").unique().to_list())
+        targets = sorted(set(stale_symbols) | (set(stock_universe) - existing_symbols))
+    else:
+        existing = pl.DataFrame(schema={"symbol": pl.Utf8, "pe_ratio": pl.Float64})
+        targets = stock_universe
+
+    if not targets:
+        return existing, {
+            "rows_before": rows_before,
+            "rows_after": existing.height,
+            "updated_symbols": 0,
+            "path": str(path),
+        }
+
+    updates = _build_pe_snapshot(max_workers=max_workers, universe=targets)
+    merged = (
+        pl.concat(
+            [existing.filter(~pl.col("symbol").is_in(updates.get_column("symbol"))), updates],
+            how="vertical_relaxed",
+        )
+        .unique(subset=["symbol"], keep="last")
+        .sort("symbol")
+    )
+    _write_parquet_atomic(merged, path)
+    return merged, {
+        "rows_before": rows_before,
+        "rows_after": merged.height,
+        "updated_symbols": updates.height,
+        "path": str(path),
+    }
+
+
+def _refresh_market_data_incremental() -> dict[str, object]:
+    from app.config import get_akshare_max_workers, get_daily_history_days
+
+    path = _resolve_parquet_path()
+    history_days = get_daily_history_days()
+    max_workers = get_akshare_max_workers()
+    universe = list_universe()
+    end_date = datetime.now()
+    fallback_start = end_date - timedelta(days=history_days)
+    end_date_str = end_date.strftime("%Y%m%d")
+
+    with _CACHE_LOCK:
+        existing = pl.read_parquet(path) if path.exists() else pl.DataFrame(schema={
+            "date": pl.Datetime,
+            "open": pl.Float64,
+            "high": pl.Float64,
+            "low": pl.Float64,
+            "close": pl.Float64,
+            "volume": pl.Float64,
+            "symbol": pl.Utf8,
+        })
+
+        rows_before = existing.height
+        latest_dates: dict[str, datetime] = {}
+        if existing.height > 0:
+            latest = existing.group_by("symbol").agg(pl.col("date").max().alias("last_date"))
+            for row in latest.iter_rows(named=True):
+                last_date = row["last_date"]
+                if isinstance(last_date, datetime):
+                    latest_dates[str(row["symbol"])] = last_date
+
+        frames: list[pd.DataFrame] = []
+        failed: list[str] = []
+        refreshed_symbols: list[str] = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {}
+            for symbol in universe:
+                last_date = latest_dates.get(symbol)
+                if last_date is None:
+                    start_dt = fallback_start
+                else:
+                    start_dt = max(
+                        fallback_start,
+                        last_date - timedelta(days=INCREMENTAL_OVERLAP_DAYS),
+                    )
+                future = executor.submit(
+                    fetch_daily_one,
+                    symbol,
+                    start_dt.strftime("%Y%m%d"),
+                    end_date_str,
+                    adjust="qfq",
+                )
+                future_map[future] = symbol
+
+            for future in as_completed(future_map):
+                symbol = future_map[future]
+                try:
+                    frame = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("incremental daily fetch failed for %s: %s", symbol, exc)
+                    failed.append(symbol)
+                    continue
+                if frame.empty:
+                    continue
+                frames.append(frame)
+                refreshed_symbols.append(symbol)
+
+        if frames:
+            updates = pl.from_pandas(
+                pd.concat(frames, ignore_index=True).sort_values(["symbol", "date"])
+            )
+            daily = _merge_daily_frames(existing, updates)
+            _write_parquet_atomic(daily, path)
+        else:
+            daily = existing
+
+        names, names_summary = _update_stock_names_incremental(universe)
+        pe_snapshot, pe_summary = _build_pe_snapshot_incremental(
+            max_workers=max_workers,
+            universe=universe,
+        )
+
+    return {
+        "mode": "incremental",
+        "daily": {
+            "rows_before": rows_before,
+            "rows_after": daily.height,
+            "rows_added": max(0, daily.height - rows_before),
+            "updated_symbols": len(set(refreshed_symbols)),
+            "failed_symbols": len(failed),
+            "path": str(path),
+        },
+        "names": names_summary,
+        "pe": pe_summary,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 对外手动刷新入口
 # ---------------------------------------------------------------------------
 
 
-def refresh_market_data() -> dict[str, object]:
-    """一站式刷新：全市场日线 + 名称 + PE 快照，返回落盘摘要。"""
+def refresh_market_data(*, mode: str = "full") -> dict[str, object]:
+    """刷新市场缓存。
+
+    ``mode='full'``: 全量重建 daily / names / pe 三张 parquet。
+    ``mode='incremental'``: 日线按 symbol 最后日期补拉，名称做 upsert，PE 按日增量。
+    """
+    if mode == "incremental":
+        return _refresh_market_data_incremental()
+    if mode != "full":
+        raise ValueError("refresh mode must be either 'full' or 'incremental'")
+
     daily = load_ashare_daily(refresh=True)
     names = load_stock_names(refresh=True)
     pe_snapshot = load_pe_snapshot(refresh=True)
 
     return {
+        "mode": "full",
         "daily": {
             "rows": daily.height,
             "symbols": daily.select(pl.col("symbol").n_unique()).item(),

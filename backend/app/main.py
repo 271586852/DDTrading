@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -112,13 +112,15 @@ def run_backtest_endpoint(payload: BacktestRequest) -> BacktestResponse:
 
 
 @app.post("/refresh")
-def refresh_data() -> dict[str, object]:
-    """手动触发全市场日线 + 名称 + PE 快照的 parquet 重建。
+def refresh_data(mode: Literal["full", "incremental"] = "incremental") -> dict[str, object]:
+    """手动刷新全市场日线 + 名称 + PE 快照。
 
-    警告：首次或全量重建可能耗时 30~60 分钟，期间接口会长时间阻塞。
-    建议在低峰期触发，或通过独立 worker 异步执行。
+    - ``mode=incremental``: 默认增量刷新，日线按已缓存最后日期补拉，PE 按日补齐。
+    - ``mode=full``: 全量重建三张 parquet；首次或全量重建可能耗时 30~60 分钟。
     """
     try:
-        return {"status": "ok", "summary": refresh_market_data()}
+        return {"status": "ok", "mode": mode, "summary": refresh_market_data(mode=mode)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive API boundary
         raise HTTPException(status_code=500, detail=f"Refresh failed: {exc}") from exc
