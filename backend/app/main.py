@@ -47,7 +47,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/strategies", response_model=List[StrategyInfo])
+@app.get("/score-strategies", response_model=List[StrategyInfo])
 def get_strategies() -> List[StrategyInfo]:
     """列出所有预设评分策略。"""
     return [

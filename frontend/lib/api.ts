@@ -54,8 +54,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function listStrategies(): Promise<StrategyInfo[]> {
-  return request<StrategyInfo[]>("/strategies");
+export function listScoreStrategies(): Promise<StrategyInfo[]> {
+  return request<StrategyInfo[]>("/score-strategies");
 }
 
 export function scoreMarket(strategyId: string): Promise<ScoreResponse> {
