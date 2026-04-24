@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -96,12 +96,29 @@ class BacktestRequest(BaseModel):
     start_date: date = Field(description="回测起始日期（含），服务端会 clamp 到可用区间。")
     end_date: date = Field(description="回测结束日期（含），服务端会 clamp 到可用区间。")
     initial_cash: float = Field(default=100_000.0, gt=0, description="初始资金。")
+    strategy_id: Optional[str] = Field(
+        default=None,
+        description="可选的交易策略 id；未指定时使用默认策略。",
+    )
 
     @model_validator(mode="after")
     def validate_date_range(self) -> "BacktestRequest":
         if self.end_date < self.start_date:
             raise ValueError("end_date must be on or after start_date.")
         return self
+
+
+class BacktestReportRequest(BacktestRequest):
+    """回测 HTML 报告导出请求体。"""
+
+    title: Optional[str] = Field(
+        default=None,
+        description="可选的报告标题；不传则由服务端自动生成。",
+    )
+    curve_freq: Literal["raw", "D"] = Field(
+        default="D",
+        description="报告曲线频率：raw 原始频率，D 为日频末值。",
+    )
 
 
 class BacktestDateRange(BaseModel):
@@ -121,6 +138,41 @@ class BacktestMetrics(BaseModel):
     final_equity: Optional[float] = None
 
 
+class TradeStrategyInfo(BaseModel):
+    """可用交易策略的对外展示结构。"""
+
+    id: str
+    name: str
+    description: str
+
+
+class EquityPoint(BaseModel):
+    """权益曲线上的一个点（带回撤百分比，前端可直接叠色）。"""
+
+    date: str
+    equity: float
+    drawdown_pct: float = Field(
+        description="相对历史峰值的回撤百分比，正数（如 3.5 表示 -3.5%）。",
+    )
+
+
+class PricePoint(BaseModel):
+    """价格/资金/持仓联动图所需的一根 K 线摘要。"""
+
+    date: str
+    close: Optional[float] = None
+
+
+class TradeMarker(BaseModel):
+    """单条成交的可视化标记。"""
+
+    date: str
+    price: Optional[float] = None
+    side: str = Field(description="'buy' | 'sell'，用于前端决定箭头方向与颜色。")
+    quantity: Optional[float] = None
+    pnl: Optional[float] = None
+
+
 class BacktestResponse(BaseModel):
     symbol: str
     requested_range: BacktestDateRange
@@ -129,6 +181,22 @@ class BacktestResponse(BaseModel):
     )
     initial_cash: float
     metrics: BacktestMetrics
+    applied_strategy: Optional[TradeStrategyInfo] = Field(
+        default=None,
+        description="实际使用的交易策略元信息。",
+    )
+    equity_curve: List[EquityPoint] = Field(
+        default_factory=list,
+        description="按时间升序的权益曲线 + 回撤，用于主图。",
+    )
+    price_series: List[PricePoint] = Field(
+        default_factory=list,
+        description="与权益曲线同区间的收盘价序列，用于叠加 K 线或副图。",
+    )
+    trade_markers: List[TradeMarker] = Field(
+        default_factory=list,
+        description="成交点位标记，前端在价格线上打买/卖箭头。",
+    )
     recent_trades: List[Dict[str, Any]] = Field(
         default_factory=list,
         description="最近 100 条交易明细（时间倒序）。",
@@ -136,6 +204,10 @@ class BacktestResponse(BaseModel):
     recent_positions: List[Dict[str, Any]] = Field(
         default_factory=list,
         description="最近 100 条持仓快照（时间倒序）。",
+    )
+    daily_positions: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="每日持仓详情（按时间升序，来自 BacktestResult.positions_df）。",
     )
 
 

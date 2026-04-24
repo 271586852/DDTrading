@@ -1,5 +1,13 @@
 import type {
+  BacktestRequest,
+  BacktestReportRequest,
+  BacktestResponse,
+  TradeStrategyInfo,
+} from "@/types/backtest";
+import type {
   QuoteResponse,
+  RefreshMode,
+  RefreshResponse,
   ScoreResponse,
   StrategyInfo,
 } from "@/types/scoring";
@@ -46,8 +54,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function listStrategies(): Promise<StrategyInfo[]> {
-  return request<StrategyInfo[]>("/strategies");
+export function listScoreStrategies(): Promise<StrategyInfo[]> {
+  return request<StrategyInfo[]>("/score-strategies");
 }
 
 export function scoreMarket(strategyId: string): Promise<ScoreResponse> {
@@ -70,6 +78,43 @@ export function scoreSingle(
 export function fetchQuote(symbol: string, bars = 120): Promise<QuoteResponse> {
   const qs = new URLSearchParams({ bars: String(bars) }).toString();
   return request<QuoteResponse>(`/quote/${encodeURIComponent(symbol)}?${qs}`);
+}
+
+export function refreshMarketData(
+  mode: RefreshMode = "incremental",
+): Promise<RefreshResponse> {
+  const qs = new URLSearchParams({ mode }).toString();
+  return request<RefreshResponse>(`/refresh?${qs}`, {
+    method: "POST",
+  });
+}
+
+export function listTradeStrategies(): Promise<TradeStrategyInfo[]> {
+  return request<TradeStrategyInfo[]>("/trade-strategies");
+}
+
+export function runBacktest(
+  payload: BacktestRequest,
+): Promise<BacktestResponse> {
+  return request<BacktestResponse>("/backtest", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function exportBacktestReport(
+  payload: BacktestReportRequest,
+): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/backtest/report`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const message = await parseError(response);
+    throw new ApiError(message, response.status);
+  }
+  return response.blob();
 }
 
 const STOCK_PREFIXES = [

@@ -1,24 +1,27 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.backtest import run_single_symbol_backtest
+from app.backtest import export_single_symbol_backtest_report, run_single_symbol_backtest
 from app.config import get_cors_origins
 from app.market_data import refresh_market_data
 from app.quotes import fetch_quote
 from app.schemas import (
     BacktestRequest,
+    BacktestReportRequest,
     BacktestResponse,
     QuoteResponse,
     ScoreRequest,
     ScoreResponse,
     StrategyInfo,
+    TradeStrategyInfo,
 )
 from app.scoring import score_stocks
 from app.strategies import list_strategies
+from app.trade_strategies import list_trade_strategies
 
 
 app = FastAPI(
@@ -44,7 +47,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/strategies", response_model=List[StrategyInfo])
+@app.get("/score-strategies", response_model=List[StrategyInfo])
 def get_strategies() -> List[StrategyInfo]:
     """列出所有预设评分策略。"""
     return [
@@ -98,6 +101,15 @@ def get_quote(symbol: str, bars: int = 120) -> QuoteResponse:
     return QuoteResponse.model_validate(data)
 
 
+@app.get("/trade-strategies", response_model=List[TradeStrategyInfo])
+def get_trade_strategies() -> List[TradeStrategyInfo]:
+    """列出所有可用于 ``/backtest`` 的交易策略。"""
+    return [
+        TradeStrategyInfo(id=spec.id, name=spec.name, description=spec.description)
+        for spec in list_trade_strategies()
+    ]
+
+
 @app.post("/backtest", response_model=BacktestResponse)
 def run_backtest_endpoint(payload: BacktestRequest) -> BacktestResponse:
     """单只股票回测（基于本地 parquet 缓存 + akquant）。"""
@@ -111,14 +123,39 @@ def run_backtest_endpoint(payload: BacktestRequest) -> BacktestResponse:
         raise HTTPException(status_code=500, detail=f"Backtest failed: {exc}") from exc
 
 
-@app.post("/refresh")
-def refresh_data() -> dict[str, object]:
-    """手动触发全市场日线 + 名称 + PE 快照的 parquet 重建。
+@app.post("/backtest/report")
+def export_backtest_report_endpoint(payload: BacktestReportRequest) -> Response:
+    """导出单只股票回测 HTML 报告。"""
+    try:
+        html = export_single_symbol_backtest_report(payload)
+        filename = f"backtest_{payload.symbol.zfill(6)}_{payload.start_date}_{payload.end_date}.html"
+        return Response(
+            content=html,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - defensive API boundary
+        raise HTTPException(
+            status_code=500, detail=f"Backtest report export failed: {exc}"
+        ) from exc
 
-    警告：首次或全量重建可能耗时 30~60 分钟，期间接口会长时间阻塞。
-    建议在低峰期触发，或通过独立 worker 异步执行。
+
+@app.post("/refresh")
+def refresh_data(mode: Literal["full", "incremental"] = "incremental") -> dict[str, object]:
+    """手动刷新全市场日线 + 名称 + PE 快照。
+
+    - ``mode=incremental``: 默认增量刷新，日线按已缓存最后日期补拉，PE 按日补齐。
+    - ``mode=full``: 全量重建三张 parquet；首次或全量重建可能耗时 30~60 分钟。
     """
     try:
-        return {"status": "ok", "summary": refresh_market_data()}
+        return {"status": "ok", "mode": mode, "summary": refresh_market_data(mode=mode)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive API boundary
         raise HTTPException(status_code=500, detail=f"Refresh failed: {exc}") from exc

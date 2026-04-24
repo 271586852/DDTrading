@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import math
+import tempfile
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -23,13 +25,24 @@ from app.schemas import (
     BacktestDateRange,
     BacktestMetrics,
     BacktestRequest,
+    BacktestReportRequest,
     BacktestResponse,
+    EquityPoint,
+    PricePoint,
+    TradeMarker,
+    TradeStrategyInfo,
+)
+from app.trade_strategies import (
+    DEFAULT_TRADE_STRATEGY_ID,
+    TradeStrategySpec,
+    get_trade_strategy,
 )
 
 
 LOGGER = logging.getLogger(__name__)
 
 MAX_DETAIL_ROWS = 100
+MAX_DAILY_POSITION_ROWS = 2000
 
 
 def _to_date(value: Any) -> date:
@@ -72,6 +85,22 @@ def _records(frame: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
     ]
 
 
+def _records_asc(frame: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
+    """按时间升序取最近 N 行，便于展示每日持仓明细。"""
+    if frame is None or frame.empty:
+        return []
+    sorted_frame = frame
+    for col in ("date", "timestamp", "time"):
+        if col in frame.columns:
+            sorted_frame = frame.sort_values(col)
+            break
+    tail = sorted_frame.tail(limit)
+    return [
+        {col: _sanitize_value(row[col]) for col in tail.columns}
+        for _, row in tail.iterrows()
+    ]
+
+
 def _metric(metrics_df: pd.DataFrame, key: str, caster=float):
     if metrics_df is None or metrics_df.empty or key not in metrics_df.index:
         return None
@@ -87,24 +116,124 @@ def _metric(metrics_df: pd.DataFrame, key: str, caster=float):
         return None
 
 
-class _DefaultBuyHoldFlipStrategy:
-    """延迟导入 akquant.Strategy 基类后在运行期动态构造策略子类。"""
+def _resolve_trade_strategy(strategy_id: str | None) -> TradeStrategySpec:
+    return get_trade_strategy(strategy_id or DEFAULT_TRADE_STRATEGY_ID)
 
 
-def _build_default_strategy_cls():
-    from akquant import Strategy
+def _coerce_iso_date(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    try:
+        return pd.Timestamp(value).date().isoformat()
+    except Exception:  # noqa: BLE001
+        return None
 
-    class _Flip100Strategy(Strategy):
-        """最小化默认策略：无仓买 100 股，有仓平 100 股。"""
 
-        def on_bar(self, bar):  # type: ignore[no-untyped-def]
-            position = self.get_position(bar.symbol)
-            if position == 0:
-                self.buy(symbol=bar.symbol, quantity=100)
-            elif position > 0:
-                self.sell(symbol=bar.symbol, quantity=100)
+def _equity_curve_points(series: Any) -> list[EquityPoint]:
+    """把 akquant 返回的 equity series 转成前端可绘制的 (date, equity, drawdown%)。"""
+    if series is None or len(series) == 0:
+        return []
 
-    return _Flip100Strategy
+    try:
+        frame = series.to_frame(name="equity").reset_index()
+    except Exception:  # noqa: BLE001
+        return []
+
+    timestamp_col = frame.columns[0]
+    frame[timestamp_col] = pd.to_datetime(frame[timestamp_col], errors="coerce")
+    frame = frame.dropna(subset=[timestamp_col, "equity"])
+    if frame.empty:
+        return []
+
+    frame = frame.sort_values(timestamp_col)
+    running_peak = frame["equity"].cummax()
+    drawdown_pct = ((running_peak - frame["equity"]) / running_peak * 100).fillna(0.0)
+
+    points: list[EquityPoint] = []
+    for ts, equity, dd in zip(
+        frame[timestamp_col].tolist(),
+        frame["equity"].tolist(),
+        drawdown_pct.tolist(),
+    ):
+        iso = _coerce_iso_date(ts)
+        if iso is None or not math.isfinite(float(equity)):
+            continue
+        points.append(
+            EquityPoint(
+                date=iso,
+                equity=float(equity),
+                drawdown_pct=float(dd) if math.isfinite(float(dd)) else 0.0,
+            )
+        )
+    return points
+
+
+def _price_series_points(data: pd.DataFrame) -> list[PricePoint]:
+    if data is None or data.empty or "date" not in data.columns:
+        return []
+    points: list[PricePoint] = []
+    for _, row in data.iterrows():
+        iso = _coerce_iso_date(row.get("date"))
+        if iso is None:
+            continue
+        close = row.get("close")
+        close_val = float(close) if close is not None and pd.notna(close) else None
+        points.append(PricePoint(date=iso, close=close_val))
+    return points
+
+
+def _trade_markers(trades_df: pd.DataFrame) -> list[TradeMarker]:
+    """把 akquant trades_df 展开成独立的买/卖点标记。"""
+    if trades_df is None or trades_df.empty:
+        return []
+
+    markers: list[TradeMarker] = []
+    for _, row in trades_df.iterrows():
+        side_raw = str(row.get("side", "")).lower()
+        is_short = side_raw == "short"
+        entry_side = "sell" if is_short else "buy"
+        exit_side = "buy" if is_short else "sell"
+
+        entry_date = _coerce_iso_date(row.get("entry_time"))
+        if entry_date is not None:
+            entry_price = row.get("entry_price")
+            markers.append(
+                TradeMarker(
+                    date=entry_date,
+                    price=float(entry_price)
+                    if entry_price is not None and pd.notna(entry_price)
+                    else None,
+                    side=entry_side,
+                    quantity=float(row.get("quantity"))
+                    if pd.notna(row.get("quantity"))
+                    else None,
+                )
+            )
+
+        exit_date = _coerce_iso_date(row.get("exit_time"))
+        if exit_date is not None:
+            exit_price = row.get("exit_price")
+            pnl = row.get("net_pnl")
+            markers.append(
+                TradeMarker(
+                    date=exit_date,
+                    price=float(exit_price)
+                    if exit_price is not None and pd.notna(exit_price)
+                    else None,
+                    side=exit_side,
+                    quantity=float(row.get("quantity"))
+                    if pd.notna(row.get("quantity"))
+                    else None,
+                    pnl=float(pnl) if pnl is not None and pd.notna(pnl) else None,
+                )
+            )
+
+    markers.sort(key=lambda m: m.date)
+    return markers
 
 
 def _resolve_symbol_window(
@@ -163,10 +292,12 @@ def run_single_symbol_backtest(
         end_req=request.end_date,
     )
 
-    strategy_cls = _build_default_strategy_cls()
+    spec = _resolve_trade_strategy(request.strategy_id)
+    strategy_cls = spec.build_cls()
     LOGGER.info(
-        "running backtest: symbol=%s range=[%s, %s] bars=%d cash=%.2f",
+        "running backtest: symbol=%s strategy=%s range=[%s, %s] bars=%d cash=%.2f",
         symbol,
+        spec.id,
         start_eff,
         end_eff,
         len(data),
@@ -184,6 +315,7 @@ def run_single_symbol_backtest(
     metrics_df = getattr(result, "metrics_df", pd.DataFrame())
     trades_df = getattr(result, "trades_df", pd.DataFrame())
     positions_df = getattr(result, "positions_df", pd.DataFrame())
+    equity_series = getattr(result, "equity_curve", None)
 
     metrics = BacktestMetrics(
         total_return=_metric(metrics_df, "total_return_pct"),
@@ -203,6 +335,67 @@ def run_single_symbol_backtest(
         effective_range=BacktestDateRange(start=start_eff, end=end_eff),
         initial_cash=request.initial_cash,
         metrics=metrics,
+        applied_strategy=TradeStrategyInfo(
+            id=spec.id, name=spec.name, description=spec.description
+        ),
+        equity_curve=_equity_curve_points(equity_series),
+        price_series=_price_series_points(data),
+        trade_markers=_trade_markers(trades_df),
         recent_trades=_records(trades_df, MAX_DETAIL_ROWS),
         recent_positions=_records(positions_df, MAX_DETAIL_ROWS),
+        daily_positions=_records_asc(positions_df, MAX_DAILY_POSITION_ROWS),
     )
+
+
+def export_single_symbol_backtest_report(
+    request: BacktestReportRequest,
+    *,
+    commission_rate: float = 0.0003,
+) -> str:
+    """执行回测并导出 HTML 报告内容。"""
+    from akquant import run_backtest
+
+    symbol = request.symbol.zfill(6)
+    data, start_eff, end_eff = _resolve_symbol_window(
+        symbol=symbol,
+        start_req=request.start_date,
+        end_req=request.end_date,
+    )
+    spec = _resolve_trade_strategy(request.strategy_id)
+    strategy_cls = spec.build_cls()
+
+    LOGGER.info(
+        "export report: symbol=%s strategy=%s range=[%s, %s] bars=%d cash=%.2f curve_freq=%s",
+        symbol,
+        spec.id,
+        start_eff,
+        end_eff,
+        len(data),
+        request.initial_cash,
+        request.curve_freq,
+    )
+
+    result = run_backtest(
+        strategy=strategy_cls,
+        data=data,
+        symbols=symbol,
+        initial_cash=request.initial_cash,
+        commission_rate=commission_rate,
+    )
+
+    default_title = (
+        f"{symbol} {spec.name} 回测报告 "
+        f"({start_eff.isoformat()} ~ {end_eff.isoformat()})"
+    )
+    report_title = request.title or default_title
+
+    with tempfile.TemporaryDirectory(prefix="ddtrading-report-") as tmpdir:
+        out_path = Path(tmpdir) / "backtest_report.html"
+        result.report(
+            title=report_title,
+            filename=str(out_path),
+            show=False,
+            compact_currency=True,
+            curve_freq=request.curve_freq,
+        )
+        return out_path.read_text(encoding="utf-8")

@@ -6,7 +6,7 @@ import {
   ApiError,
   classifySymbol,
   fetchQuote,
-  listStrategies,
+  listScoreStrategies,
   normalizeSymbol,
   scoreMarket,
   scoreSingle,
@@ -135,7 +135,7 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
 
   loadStrategies: async () => {
     try {
-      const strategies = await listStrategies();
+      const strategies = await listScoreStrategies();
       set((state) => ({
         ...state,
         strategies,

@@ -11,7 +11,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $backendScript = Join-Path $PSScriptRoot "start-backend.ps1"
 $frontendScript = Join-Path $PSScriptRoot "start-frontend.ps1"
 $apiBaseUrl = "http://$HostAddress`:$BackendPort"
-$corsOrigins = "http://127.0.0.1:$FrontendPort"
+$corsOrigins = "http://127.0.0.1:$FrontendPort,http://localhost:$FrontendPort"
 
 Start-Process powershell -ArgumentList @(
     "-NoExit",
