@@ -67,24 +67,31 @@ export function BacktestForm() {
           />
         </Field>
 
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field icon={<Calendar className="h-4 w-4" strokeWidth={1.6} />} label="开始">
+        <label className="flex flex-col gap-1.5">
+          <span className="text-[11px] font-medium uppercase tracking-[0.3em] text-slate-500">
+            回测区间
+          </span>
+          <div className="flex items-center gap-2 rounded-2xl border border-white/5 bg-slate-950/60 px-4 py-2.5 transition-all focus-within:border-cyan-400/60 focus-within:shadow-[0_0_18px_rgba(56,189,248,0.25)]">
+            <span className="text-slate-400">
+              <Calendar className="h-4 w-4" strokeWidth={1.6} />
+            </span>
             <input
               type="date"
+              aria-label="开始日期"
               value={form.startDate}
               onChange={(e) => setForm({ startDate: e.target.value })}
-              className="flex-1 bg-transparent text-sm text-white outline-none [color-scheme:dark]"
+              className="date-input-no-picker flex-1 bg-transparent text-sm text-white outline-none [color-scheme:dark]"
             />
-          </Field>
-          <Field icon={<Calendar className="h-4 w-4" strokeWidth={1.6} />} label="结束">
+            <span className="text-xs text-slate-500">至</span>
             <input
               type="date"
+              aria-label="结束日期"
               value={form.endDate}
               onChange={(e) => setForm({ endDate: e.target.value })}
-              className="flex-1 bg-transparent text-sm text-white outline-none [color-scheme:dark]"
+              className="date-input-no-picker flex-1 bg-transparent text-sm text-white outline-none [color-scheme:dark]"
             />
-          </Field>
-        </div>
+          </div>
+        </label>
 
         <Field icon={<Coins className="h-4 w-4" strokeWidth={1.6} />} label="初始资金">
           <input
@@ -186,7 +193,7 @@ function Field({
   label,
   children,
 }: {
-  icon: React.ReactNode;
+  icon?: React.ReactNode;
   label: string;
   children: React.ReactNode;
 }) {
@@ -196,7 +203,7 @@ function Field({
         {label}
       </span>
       <div className="flex items-center gap-2 rounded-2xl border border-white/5 bg-slate-950/60 px-4 py-2.5 transition-all focus-within:border-cyan-400/60 focus-within:shadow-[0_0_18px_rgba(56,189,248,0.25)]">
-        <span className="text-slate-400">{icon}</span>
+        {icon && <span className="text-slate-400">{icon}</span>}
         {children}
       </div>
     </label>
