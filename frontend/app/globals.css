@@ -47,6 +47,27 @@ input {
   font: inherit;
 }
 
+/* Hide native date picker icon; keep a single custom calendar icon in UI. */
+.date-input-no-picker::-webkit-calendar-picker-indicator {
+  display: none !important;
+  -webkit-appearance: none;
+  opacity: 0;
+  width: 0;
+  margin: 0;
+  padding: 0;
+  pointer-events: none;
+}
+
+.date-input-no-picker::-webkit-inner-spin-button {
+  display: none;
+}
+
+.date-input-no-picker {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: none;
+}
+
 .glass-panel {
   background: var(--panel);
   border: 1px solid var(--panel-border);
