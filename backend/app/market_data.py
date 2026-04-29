@@ -4,7 +4,7 @@
 1. 在 import akshare 之前完成网络预处理（清代理环境变量 + 覆盖 requests.Session
    为 `trust_env=False` 且带浏览器请求头），避免 akshare 内部会话继承到不可用的
    系统代理。
-2. 提供多源 fallback 的单只日线获取：tencent -> sina -> eastmoney。
+2. 提供多源 fallback 的单只日线获取：baostock -> tencent -> sina -> eastmoney。
 3. 维护股票池：沪深主板 + 创业板 + 科创板 + A 股 ETF，排除北交所。
 4. 把全市场日线落到 parquet，并做 TTL/原子写盘。
 5. 额外维护两张轻量面板：股票名称快照 `stock_names.parquet`，PE 快照
@@ -115,6 +115,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency guard
     ak = None  # type: ignore[assignment]
 
+try:
+    import baostock as bs  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency guard
+    bs = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # 股票代码工具
@@ -157,6 +162,19 @@ def _with_market_prefix(symbol: str) -> str:
     if code.startswith(("4", "8")):
         return f"bj{code}"
     return f"sh{code}"
+
+
+def _with_baostock_prefix(symbol: str) -> str:
+    """为 BaoStock 接口补齐 ``sh.600000`` / ``sz.000001`` 前缀。"""
+    code = _normalize_symbol(symbol)
+    if code.startswith(("0", "1", "2", "3")):
+        return f"sz.{code}"
+    if code.startswith(("5", "6", "9")):
+        return f"sh.{code}"
+    if code.startswith(("4", "8")):
+        # BaoStock 不支持北交所，给默认值避免异常代码穿透。
+        return f"sh.{code}"
+    return f"sh.{code}"
 
 
 def is_in_universe(symbol: str) -> bool:
@@ -233,6 +251,91 @@ def _normalize(
 # ---------------------------------------------------------------------------
 # 数据源适配
 # ---------------------------------------------------------------------------
+
+
+_BAOSTOCK_LOGIN_LOCK = RLock()
+_BAOSTOCK_API_LOCK = RLock()
+_BAOSTOCK_LOGGED_IN = False
+
+
+def _ensure_baostock_login() -> None:
+    global _BAOSTOCK_LOGGED_IN
+    if bs is None:
+        raise ModuleNotFoundError("baostock is not installed")
+    if _BAOSTOCK_LOGGED_IN:
+        return
+    with _BAOSTOCK_LOGIN_LOCK:
+        if _BAOSTOCK_LOGGED_IN:
+            return
+        result = bs.login()
+        if result.error_code != "0":
+            raise RuntimeError(f"baostock login failed: {result.error_code} {result.error_msg}")
+        _BAOSTOCK_LOGGED_IN = True
+
+
+def _fetch_baostock(
+    symbol: str, start_date: str, end_date: str, adjust: str
+) -> pd.DataFrame:
+    _ensure_baostock_login()
+    adjust_map = {
+        "hfq": "1",
+        "qfq": "2",
+        "": "3",
+        "none": "3",
+        "bfq": "3",
+    }
+    adjust_flag = adjust_map.get((adjust or "").strip().lower(), "2")
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            # BaoStock 的 Python 客户端维护全局连接状态，并发读取时容易出现
+            # UnicodeDecodeError/接收数据异常；串行化单次 API 调用以保持响应完整。
+            with _BAOSTOCK_API_LOCK:
+                rs = bs.query_history_k_data_plus(
+                    _with_baostock_prefix(symbol),
+                    fields="date,open,high,low,close,volume",
+                    start_date=datetime.strptime(start_date, "%Y%m%d").strftime("%Y-%m-%d"),
+                    end_date=datetime.strptime(end_date, "%Y%m%d").strftime("%Y-%m-%d"),
+                    frequency="d",
+                    adjustflag=adjust_flag,
+                )
+                if rs is None:
+                    raise RuntimeError("baostock returned no response")
+                if rs.error_code != "0":
+                    raise RuntimeError(
+                        f"baostock query failed: {rs.error_code} {rs.error_msg}"
+                    )
+
+                rows: list[list[str]] = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                fields = list(rs.fields)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt == 0:
+                time.sleep(0.2)
+                continue
+            raise RuntimeError(f"baostock query failed after retry: {last_exc}") from exc
+    else:  # pragma: no cover - loop always exits via break/raise
+        raise RuntimeError(f"baostock query failed: {last_exc}")
+
+    if not rows:
+        raise RuntimeError("baostock returned empty data")
+
+    raw = pd.DataFrame(rows, columns=fields)
+    return _normalize(
+        raw,
+        symbol=symbol,
+        column_mapping={
+            "date": "date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
+        },
+    )
 
 
 def _fetch_tencent(
@@ -314,6 +417,7 @@ def _fetch_eastmoney(
 FetcherFn = Callable[[str, str, str, str], pd.DataFrame]
 
 DATA_SOURCES: list[tuple[str, FetcherFn]] = [
+    ("baostock", _fetch_baostock),
     ("tencent", _fetch_tencent),
     ("sina", _fetch_sina),
     ("eastmoney", _fetch_eastmoney),
@@ -329,8 +433,8 @@ def fetch_daily_one(
     sources: Iterable[tuple[str, FetcherFn]] | None = None,
 ) -> pd.DataFrame:
     """按顺序尝试多个数据源，任意一个成功即返回。"""
-    if ak is None:
-        raise ModuleNotFoundError("akshare is not installed")
+    if ak is None and bs is None:
+        raise ModuleNotFoundError("neither baostock nor akshare is installed")
 
     last_exc: Exception | None = None
     for name, fetcher in sources or DATA_SOURCES:
@@ -350,13 +454,45 @@ def fetch_daily_one(
 
 def list_universe() -> list[str]:
     """获取股票池代码列表：A 股股票 + A 股场内 ETF。"""
-    if ak is None:
-        raise ModuleNotFoundError("akshare is not installed")
+    frames: list[pd.DataFrame] = []
 
-    stocks = _fetch_sina_stock_snapshot()
-    etfs = _fetch_sina_etf_snapshot()
+    if bs is not None:
+        _ensure_baostock_login()
+        today = datetime.now().strftime("%Y-%m-%d")
+        with _BAOSTOCK_API_LOCK:
+            rs = bs.query_all_stock(day=today)
+            if rs is None:
+                raise RuntimeError("baostock query_all_stock returned no response")
+            if rs.error_code != "0":
+                raise RuntimeError(
+                    f"baostock query_all_stock failed: {rs.error_code} {rs.error_msg}"
+                )
+            rows: list[list[str]] = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+            fields = list(rs.fields)
+        if rows:
+            raw = pd.DataFrame(rows, columns=fields)
+            code_col = "code" if "code" in raw.columns else raw.columns[0]
+            stocks = (
+                pd.DataFrame({"symbol": raw[code_col].astype(str).map(_normalize_symbol)})
+                .dropna(subset=["symbol"])
+                .loc[lambda x: x["symbol"].map(_is_stock_symbol)]
+            )
+            frames.append(stocks)
+
+    if ak is not None:
+        try:
+            etfs = _fetch_sina_etf_snapshot()
+            frames.append(etfs[["symbol"]])
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("fetch ETF universe from akshare failed: %s", exc)
+
+    if not frames:
+        raise RuntimeError("failed to build universe from baostock/akshare")
+
     merged = (
-        pd.concat([stocks[["symbol"]], etfs[["symbol"]]], ignore_index=True)
+        pd.concat(frames, ignore_index=True)
         .drop_duplicates(subset=["symbol"])
         .sort_values("symbol")
         .reset_index(drop=True)
@@ -406,8 +542,8 @@ def _build_daily_dataset(
     max_workers: int,
     universe: list[str] | None = None,
 ) -> pl.DataFrame:
-    if ak is None:
-        raise ModuleNotFoundError("akshare is not installed")
+    if ak is None and bs is None:
+        raise ModuleNotFoundError("neither baostock nor akshare is installed")
 
     end_date_str = datetime.now().strftime("%Y%m%d")
     start_date_str = (
@@ -457,16 +593,16 @@ def _build_daily_dataset(
     return pl.from_pandas(merged)
 
 
-def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
-    """加载股票池日线（A 股股票 + ETF）；必要时联网重建并写 parquet。"""
+def load_baostock_daily(*, refresh: bool = False) -> pl.DataFrame:
+    """加载 BaoStock 主导的股票池日线（A 股股票 + ETF）。"""
     from app.config import (
         get_akshare_max_workers,
         get_daily_cache_ttl_hours,
         get_daily_history_days,
-        get_daily_parquet_path,
+        get_baostock_daily_parquet_path,
     )
 
-    path = get_daily_parquet_path()
+    path = get_baostock_daily_parquet_path()
 
     with _CACHE_LOCK:
         if not refresh and _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
@@ -482,15 +618,20 @@ def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
         return dataset
 
 
+def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
+    """兼容旧接口名：内部已切换为 BaoStock 日线缓存。"""
+    return load_baostock_daily(refresh=refresh)
+
+
 # ---------------------------------------------------------------------------
 # 股票名称 & PE 快照
 # ---------------------------------------------------------------------------
 
 
 def _sibling_parquet(name: str) -> Path:
-    from app.config import get_daily_parquet_path
+    from app.config import get_baostock_daily_parquet_path
 
-    return get_daily_parquet_path().parent / name
+    return get_baostock_daily_parquet_path().parent / name
 
 
 def _stock_names_path() -> Path:
@@ -669,18 +810,24 @@ def _build_pe_snapshot(
 
 
 def load_pe_snapshot(*, refresh: bool = False) -> pl.DataFrame:
-    """加载 ``symbol / pe_ratio`` 快照；必要时联网重建并写 parquet。"""
-    from app.config import get_akshare_max_workers, get_daily_cache_ttl_hours
+    """加载 ``symbol / pe_ratio`` 快照（只读本地，不自动联网拉取）。"""
+    del refresh
+    from app.config import get_daily_cache_ttl_hours
 
     path = _pe_snapshot_path()
 
     with _CACHE_LOCK:
-        if not refresh and _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
+        if _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
             return pl.read_parquet(path)
-
-        dataset = _build_pe_snapshot(max_workers=get_akshare_max_workers())
-        _write_parquet_atomic(dataset, path)
-        return dataset
+        if path.exists():
+            return pl.read_parquet(path)
+        return pl.DataFrame(
+            schema={
+                "symbol": pl.Utf8,
+                "pe_ratio": pl.Float64,
+                "updated_at": pl.Utf8,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -894,11 +1041,7 @@ def _refresh_market_data_incremental() -> dict[str, object]:
         else:
             daily = existing
 
-        names, names_summary = _update_stock_names_incremental(universe)
-        pe_snapshot, pe_summary = _build_pe_snapshot_incremental(
-            max_workers=max_workers,
-            universe=universe,
-        )
+        _names, names_summary = _update_stock_names_incremental(universe)
 
     return {
         "mode": "incremental",
@@ -911,7 +1054,11 @@ def _refresh_market_data_incremental() -> dict[str, object]:
             "path": str(path),
         },
         "names": names_summary,
-        "pe": pe_summary,
+        "pe": {
+            "status": "skipped",
+            "reason": "auto PE refresh disabled",
+            "path": str(_pe_snapshot_path()),
+        },
     }
 
 
@@ -931,9 +1078,8 @@ def refresh_market_data(*, mode: str = "full") -> dict[str, object]:
     if mode != "full":
         raise ValueError("refresh mode must be either 'full' or 'incremental'")
 
-    daily = load_ashare_daily(refresh=True)
+    daily = load_baostock_daily(refresh=True)
     names = load_stock_names(refresh=True)
-    pe_snapshot = load_pe_snapshot(refresh=True)
 
     return {
         "mode": "full",
@@ -947,7 +1093,8 @@ def refresh_market_data(*, mode: str = "full") -> dict[str, object]:
             "path": str(_stock_names_path()),
         },
         "pe": {
-            "rows": pe_snapshot.height,
+            "status": "skipped",
+            "reason": "auto PE refresh disabled",
             "path": str(_pe_snapshot_path()),
         },
     }
@@ -1016,14 +1163,14 @@ def ensure_symbol_cached(
     days: int = 365,
     adjust: str = "qfq",
 ) -> dict[str, object]:
-    """按需把单只股票的 daily / PE / 名称增量写入三张 parquet 缓存。
+    """按需把单只股票的 daily / 名称增量写入本地 parquet 缓存。
 
     用于 ``/score`` 单股路径冷命中时按需补齐——不重建全市场，只追加/覆盖这一只。
 
     - 非股票池代码（北交所或非法）→ ``ValueError``
     - ETF → ``ValueError``（评分管线不支持 ETF）
     - daily 拉不到 → 上抛 ``RuntimeError``（多源 fallback 都失败）
-    - PE 拉不到 → 不致命，只落 daily/name；上层评分会因缺 PE 继续 404
+    - PE 自动拉取默认关闭：不会在此函数内联网抓取 PE
     """
     code = _normalize_symbol(symbol)
 
@@ -1047,33 +1194,24 @@ def ensure_symbol_cached(
         raise RuntimeError(f"fetched daily is empty for {code}")
     new_daily = pl.from_pandas(daily_pd)
 
-    try:
-        pe_value = _fetch_pe_one(code)
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("pe fetch failed for %s: %s", code, exc)
-        pe_value = None
-
     name = _fetch_single_stock_name(code)
 
     with _CACHE_LOCK:
         daily_rows = _upsert_daily(new_daily, code)
-        if pe_value is not None:
-            _upsert_pe(code, pe_value)
         if name:
             _upsert_name(code, name)
 
     LOGGER.info(
-        "ensure_symbol_cached: %s -> daily=%d rows, pe=%s, name=%r",
+        "ensure_symbol_cached: %s -> daily=%d rows, name=%r",
         code,
         daily_rows,
-        pe_value,
         name,
     )
 
     return {
         "symbol": code,
         "daily_rows": daily_rows,
-        "pe_ratio": pe_value,
+        "pe_ratio": None,
         "name": name,
         "window": {"start": start_date_str, "end": end_date_str},
     }
@@ -1081,7 +1219,7 @@ def ensure_symbol_cached(
 
 def refresh_ashare_daily() -> dict[str, int | str]:
     """仅刷新日线 parquet（不触发 PE/名称刷新）。"""
-    dataset = load_ashare_daily(refresh=True)
+    dataset = load_baostock_daily(refresh=True)
     return {
         "rows": dataset.height,
         "symbols": dataset.select(pl.col("symbol").n_unique()).item(),
@@ -1090,6 +1228,6 @@ def refresh_ashare_daily() -> dict[str, int | str]:
 
 
 def _resolve_parquet_path() -> Path:
-    from app.config import get_daily_parquet_path
+    from app.config import get_baostock_daily_parquet_path
 
-    return get_daily_parquet_path()
+    return get_baostock_daily_parquet_path()

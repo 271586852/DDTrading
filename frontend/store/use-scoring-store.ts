@@ -22,6 +22,22 @@ import type {
 
 const HISTORY_KEY = "ddt.history.v1";
 const HISTORY_LIMIT = 30;
+const SCORE_CACHE_KEY = "ddt.score-cache.v1";
+const SCORE_CACHE_LIMIT = 120;
+
+type ScoreCacheMode = "single" | "etf-skip";
+
+type ScoreCacheEntry = {
+  key: string;
+  symbol: string;
+  strategyId: string;
+  asOfDate: string;
+  quote: QuoteResponse;
+  analysis: RankedStock | null;
+  analysisMode: ScoreCacheMode;
+  scoreUniverseSize: number | null;
+  cachedAt: number;
+};
 
 function loadHistory(): HistoryEntry[] {
   if (typeof window === "undefined") return [];
@@ -42,6 +58,38 @@ function persistHistory(entries: HistoryEntry[]): void {
   } catch {
     // ignore quota errors
   }
+}
+
+function loadScoreCache(): ScoreCacheEntry[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(SCORE_CACHE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as ScoreCacheEntry[];
+    return Array.isArray(parsed) ? parsed.slice(0, SCORE_CACHE_LIMIT) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistScoreCache(entries: ScoreCacheEntry[]): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      SCORE_CACHE_KEY,
+      JSON.stringify(entries.slice(0, SCORE_CACHE_LIMIT)),
+    );
+  } catch {
+    // ignore quota errors
+  }
+}
+
+function makeScoreCacheKey(
+  symbol: string,
+  strategyId: string,
+  asOfDate: string | null | undefined,
+): string {
+  return `${symbol}::${strategyId}::${asOfDate ?? ""}`;
 }
 
 function makeHistoryEntry(params: {
@@ -201,7 +249,7 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
       const message =
         err instanceof ApiError
           ? err.status === 404
-            ? `代码 ${normalized} 不在本地缓存中，请先在后端执行 /refresh 刷新。`
+            ? `代码 ${normalized} 暂无可用行情（后端已尝试按需补单股）。请稍后重试或手动执行 /refresh。`
             : err.message
           : err instanceof Error
             ? err.message
@@ -220,24 +268,36 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
     let universe: number | null = null;
     let scoreError: string | null = null;
     let analysisMode: "single" | "etf-skip" = "single";
+    const cacheKey = makeScoreCacheKey(
+      normalized,
+      strategyId,
+      quote?.as_of_date ?? "",
+    );
 
     if (suppressScore) {
       analysisMode = "etf-skip";
     } else {
-      set((state) => ({ ...state, taskStage: "scoring" }));
-      try {
-        const payload = await scoreSingle(strategyId, normalized);
-        const res = applyScoreRow(payload);
-        analysis = res.row;
-        universe = res.universe;
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 400) {
-          // ETF detected server-side → degrade to etf-skip
-          analysisMode = "etf-skip";
-        } else if (err instanceof ApiError && err.status === 404) {
-          scoreError = `代码 ${normalized} 尚未在评分数据集中，可能还没刷 PE 或因子快照。`;
-        } else {
-          scoreError = err instanceof Error ? err.message : "评分失败";
+      const cached = loadScoreCache().find((entry) => entry.key === cacheKey);
+      if (cached) {
+        analysis = cached.analysis;
+        universe = cached.scoreUniverseSize;
+        analysisMode = cached.analysisMode;
+      } else {
+        set((state) => ({ ...state, taskStage: "scoring" }));
+        try {
+          const payload = await scoreSingle(strategyId, normalized);
+          const res = applyScoreRow(payload);
+          analysis = res.row;
+          universe = res.universe;
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 400) {
+            // ETF detected server-side → degrade to etf-skip
+            analysisMode = "etf-skip";
+          } else if (err instanceof ApiError && err.status === 404) {
+            scoreError = `代码 ${normalized} 的评分因子仍不完整（后端已按需补单股），可能缺少 PE 或历史日线不足。`;
+          } else {
+            scoreError = err instanceof Error ? err.message : "评分失败";
+          }
         }
       }
     }
@@ -256,6 +316,23 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
       );
       const nextHistory = [entry, ...filtered].slice(0, HISTORY_LIMIT);
       persistHistory(nextHistory);
+      if (!scoreError) {
+        const nextCache = [
+          {
+            key: cacheKey,
+            symbol: normalized,
+            strategyId,
+            asOfDate: quote?.as_of_date ?? "",
+            quote: quote as QuoteResponse,
+            analysis,
+            analysisMode,
+            scoreUniverseSize: universe,
+            cachedAt: Date.now(),
+          },
+          ...loadScoreCache().filter((item) => item.key !== cacheKey),
+        ];
+        persistScoreCache(nextCache);
+      }
       return {
         ...state,
         isAnalyzing: false,
