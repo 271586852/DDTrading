@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
   "akquant>=0.2.13",
   "akshare>=1.16.0",
+  "baostock>=0.8.9",
   "fastapi>=0.115.0",
   "pandas>=2.2.0",
   "polars>=1.30.0",

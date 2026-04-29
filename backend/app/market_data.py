@@ -4,7 +4,7 @@
 1. 在 import akshare 之前完成网络预处理（清代理环境变量 + 覆盖 requests.Session
    为 `trust_env=False` 且带浏览器请求头），避免 akshare 内部会话继承到不可用的
    系统代理。
-2. 提供多源 fallback 的单只日线获取：tencent -> sina -> eastmoney。
+2. 提供多源 fallback 的单只日线获取：baostock -> tencent -> sina -> eastmoney。
 3. 维护股票池：沪深主板 + 创业板 + 科创板 + A 股 ETF，排除北交所。
 4. 把全市场日线落到 parquet，并做 TTL/原子写盘。
 5. 额外维护两张轻量面板：股票名称快照 `stock_names.parquet`，PE 快照
@@ -115,6 +115,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency guard
     ak = None  # type: ignore[assignment]
 
+try:
+    import baostock as bs  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency guard
+    bs = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # 股票代码工具
@@ -157,6 +162,19 @@ def _with_market_prefix(symbol: str) -> str:
     if code.startswith(("4", "8")):
         return f"bj{code}"
     return f"sh{code}"
+
+
+def _with_baostock_prefix(symbol: str) -> str:
+    """为 BaoStock 接口补齐 ``sh.600000`` / ``sz.000001`` 前缀。"""
+    code = _normalize_symbol(symbol)
+    if code.startswith(("0", "1", "2", "3")):
+        return f"sz.{code}"
+    if code.startswith(("5", "6", "9")):
+        return f"sh.{code}"
+    if code.startswith(("4", "8")):
+        # BaoStock 不支持北交所，给默认值避免异常代码穿透。
+        return f"sh.{code}"
+    return f"sh.{code}"
 
 
 def is_in_universe(symbol: str) -> bool:
@@ -233,6 +251,91 @@ def _normalize(
 # ---------------------------------------------------------------------------
 # 数据源适配
 # ---------------------------------------------------------------------------
+
+
+_BAOSTOCK_LOGIN_LOCK = RLock()
+_BAOSTOCK_API_LOCK = RLock()
+_BAOSTOCK_LOGGED_IN = False
+
+
+def _ensure_baostock_login() -> None:
+    global _BAOSTOCK_LOGGED_IN
+    if bs is None:
+        raise ModuleNotFoundError("baostock is not installed")
+    if _BAOSTOCK_LOGGED_IN:
+        return
+    with _BAOSTOCK_LOGIN_LOCK:
+        if _BAOSTOCK_LOGGED_IN:
+            return
+        result = bs.login()
+        if result.error_code != "0":
+            raise RuntimeError(f"baostock login failed: {result.error_code} {result.error_msg}")
+        _BAOSTOCK_LOGGED_IN = True
+
+
+def _fetch_baostock(
+    symbol: str, start_date: str, end_date: str, adjust: str
+) -> pd.DataFrame:
+    _ensure_baostock_login()
+    adjust_map = {
+        "hfq": "1",
+        "qfq": "2",
+        "": "3",
+        "none": "3",
+        "bfq": "3",
+    }
+    adjust_flag = adjust_map.get((adjust or "").strip().lower(), "2")
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            # BaoStock 的 Python 客户端维护全局连接状态，并发读取时容易出现
+            # UnicodeDecodeError/接收数据异常；串行化单次 API 调用以保持响应完整。
+            with _BAOSTOCK_API_LOCK:
+                rs = bs.query_history_k_data_plus(
+                    _with_baostock_prefix(symbol),
+                    fields="date,open,high,low,close,volume",
+                    start_date=datetime.strptime(start_date, "%Y%m%d").strftime("%Y-%m-%d"),
+                    end_date=datetime.strptime(end_date, "%Y%m%d").strftime("%Y-%m-%d"),
+                    frequency="d",
+                    adjustflag=adjust_flag,
+                )
+                if rs is None:
+                    raise RuntimeError("baostock returned no response")
+                if rs.error_code != "0":
+                    raise RuntimeError(
+                        f"baostock query failed: {rs.error_code} {rs.error_msg}"
+                    )
+
+                rows: list[list[str]] = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                fields = list(rs.fields)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt == 0:
+                time.sleep(0.2)
+                continue
+            raise RuntimeError(f"baostock query failed after retry: {last_exc}") from exc
+    else:  # pragma: no cover - loop always exits via break/raise
+        raise RuntimeError(f"baostock query failed: {last_exc}")
+
+    if not rows:
+        raise RuntimeError("baostock returned empty data")
+
+    raw = pd.DataFrame(rows, columns=fields)
+    return _normalize(
+        raw,
+        symbol=symbol,
+        column_mapping={
+            "date": "date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
+        },
+    )
 
 
 def _fetch_tencent(
@@ -314,6 +417,7 @@ def _fetch_eastmoney(
 FetcherFn = Callable[[str, str, str, str], pd.DataFrame]
 
 DATA_SOURCES: list[tuple[str, FetcherFn]] = [
+    ("baostock", _fetch_baostock),
     ("tencent", _fetch_tencent),
     ("sina", _fetch_sina),
     ("eastmoney", _fetch_eastmoney),
@@ -350,13 +454,45 @@ def fetch_daily_one(
 
 def list_universe() -> list[str]:
     """获取股票池代码列表：A 股股票 + A 股场内 ETF。"""
-    if ak is None:
-        raise ModuleNotFoundError("akshare is not installed")
+    frames: list[pd.DataFrame] = []
 
-    stocks = _fetch_sina_stock_snapshot()
-    etfs = _fetch_sina_etf_snapshot()
+    if bs is not None:
+        _ensure_baostock_login()
+        today = datetime.now().strftime("%Y-%m-%d")
+        with _BAOSTOCK_API_LOCK:
+            rs = bs.query_all_stock(day=today)
+            if rs is None:
+                raise RuntimeError("baostock query_all_stock returned no response")
+            if rs.error_code != "0":
+                raise RuntimeError(
+                    f"baostock query_all_stock failed: {rs.error_code} {rs.error_msg}"
+                )
+            rows: list[list[str]] = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+            fields = list(rs.fields)
+        if rows:
+            raw = pd.DataFrame(rows, columns=fields)
+            code_col = "code" if "code" in raw.columns else raw.columns[0]
+            stocks = (
+                pd.DataFrame({"symbol": raw[code_col].astype(str).map(_normalize_symbol)})
+                .dropna(subset=["symbol"])
+                .loc[lambda x: x["symbol"].map(_is_stock_symbol)]
+            )
+            frames.append(stocks)
+
+    if ak is not None:
+        try:
+            etfs = _fetch_sina_etf_snapshot()
+            frames.append(etfs[["symbol"]])
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("fetch ETF universe from akshare failed: %s", exc)
+
+    if not frames:
+        raise RuntimeError("failed to build universe from baostock/akshare")
+
     merged = (
-        pd.concat([stocks[["symbol"]], etfs[["symbol"]]], ignore_index=True)
+        pd.concat(frames, ignore_index=True)
         .drop_duplicates(subset=["symbol"])
         .sort_values("symbol")
         .reset_index(drop=True)
