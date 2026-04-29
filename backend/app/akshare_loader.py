@@ -15,7 +15,7 @@ import logging
 
 import polars as pl
 
-from app.market_data import load_ashare_daily, load_pe_snapshot, load_stock_names
+from app.market_data import load_baostock_daily, load_pe_snapshot, load_stock_names
 
 
 LOGGER = logging.getLogger(__name__)
@@ -100,7 +100,7 @@ def load_akshare_dataset(
     """
     del history_days, max_workers, cache_ttl_seconds  # 仅为了签名兼容
 
-    daily = load_ashare_daily()
+    daily = load_baostock_daily()
     names = load_stock_names()
     pe_snapshot = load_pe_snapshot()
 

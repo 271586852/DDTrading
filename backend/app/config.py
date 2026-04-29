@@ -8,6 +8,7 @@ from typing import Literal
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_PATH = BACKEND_ROOT / "data" / "mock_data.parquet"
 DEFAULT_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "ashare_daily.parquet"
+DEFAULT_BAOSTOCK_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "baostock_daily.parquet"
 DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
     "http://127.0.0.1:3000",
     "http://localhost:3000",
@@ -90,6 +91,14 @@ def get_daily_parquet_path() -> Path:
     raw_path = os.getenv("DDTRADING_DAILY_PARQUET_PATH")
     if not raw_path:
         return DEFAULT_DAILY_PARQUET_PATH
+    return Path(raw_path).expanduser().resolve()
+
+
+def get_baostock_daily_parquet_path() -> Path:
+    """BaoStock 日线 parquet 的存储路径。"""
+    raw_path = os.getenv("DDTRADING_BAOSTOCK_DAILY_PARQUET_PATH")
+    if not raw_path:
+        return DEFAULT_BAOSTOCK_DAILY_PARQUET_PATH
     return Path(raw_path).expanduser().resolve()
 
 
