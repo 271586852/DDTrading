@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict
 import logging
 
@@ -26,6 +27,7 @@ FACTOR_COLUMNS = {
 REQUIRED_COLUMNS = ["ticker", "name", "pe_ratio", "momentum_20d", "volatility"]
 
 LOGGER = logging.getLogger(__name__)
+SINGLE_STOCK_ONLY_STRATEGY_ID = "single_stock_only"
 
 
 def _raw_weights(payload: ScoreRequest) -> tuple[Dict[str, float], ScoringStrategy | None]:
@@ -176,6 +178,106 @@ def _rank_dataset(dataset: pl.DataFrame, weights: Dict[str, float]) -> pl.DataFr
     return scored
 
 
+def _build_single_symbol_dataset(symbol: str) -> pl.DataFrame:
+    from app.market_data import ensure_symbol_cached, load_ashare_daily, load_pe_snapshot, load_stock_names
+
+    ensure_symbol_cached(symbol)
+
+    daily = load_ashare_daily()
+    one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
+    if one_daily.height < 21:
+        raise KeyError(f"Symbol '{symbol}' has insufficient daily bars for single-stock scoring.")
+
+    prepared = one_daily.with_columns(
+        pl.col("close").pct_change().alias("daily_return")
+    )
+    factor_row = prepared.select(
+        [
+            (pl.col("close").last() / pl.col("close").shift(20).last() - 1.0).alias("momentum_20d"),
+            pl.col("daily_return").tail(20).std(ddof=0).alias("volatility"),
+            pl.col("daily_return").drop_nulls().count().alias("valid_returns"),
+        ]
+    ).to_dicts()[0]
+
+    momentum_20d = factor_row["momentum_20d"]
+    volatility = factor_row["volatility"]
+    valid_returns = int(factor_row["valid_returns"] or 0)
+    if momentum_20d is None or volatility is None or valid_returns < 20:
+        raise KeyError(f"Symbol '{symbol}' has incomplete factor data for single-stock scoring.")
+
+    pe_snapshot = load_pe_snapshot()
+    pe_match = pe_snapshot.filter(pl.col("symbol") == symbol)
+    if pe_match.height == 0:
+        raise KeyError(f"Symbol '{symbol}' has no PE data for single-stock scoring.")
+    pe_ratio = pe_match.select(pl.col("pe_ratio").last()).item()
+    if pe_ratio is None:
+        raise KeyError(f"Symbol '{symbol}' has null PE data for single-stock scoring.")
+
+    names = load_stock_names()
+    name_match = names.filter(pl.col("symbol") == symbol)
+    name = (
+        name_match.select(pl.col("name").last()).item()
+        if name_match.height > 0
+        else symbol
+    )
+
+    return pl.DataFrame(
+        {
+            "ticker": [symbol],
+            "name": [str(name or symbol)],
+            "pe_ratio": [float(pe_ratio)],
+            "momentum_20d": [float(momentum_20d)],
+            "volatility": [float(volatility)],
+        }
+    )
+
+
+def _score_single_stock_only(
+    symbol: str,
+    weights: Dict[str, float],
+) -> dict[str, object]:
+    dataset = _build_single_symbol_dataset(symbol)
+    row = dataset.to_dicts()[0]
+
+    # 单股模式下没有横截面对比，采用稳定单调映射得到可解释的 0~100 分。
+    pe_factor = -math.log1p(max(float(row["pe_ratio"]), 0.0))
+    momentum_factor = float(row["momentum_20d"])
+    volatility_factor = -float(row["volatility"])
+    raw_score = (
+        pe_factor * weights["pe_weight"]
+        + momentum_factor * weights["momentum_weight"]
+        + volatility_factor * weights["volatility_weight"]
+    )
+    total_score = round(100.0 / (1.0 + math.exp(-raw_score)), 2)
+
+    return {
+        "normalized_weights": {
+            key: round(value, 4) for key, value in weights.items()
+        },
+        "total_universe": 1,
+        "returned_count": 1,
+        "mode": "single",
+        "top_50": [
+            {
+                "rank": 1,
+                "ticker": row["ticker"],
+                "name": row["name"],
+                "total_score": total_score,
+                "factor_values": {
+                    "pe_ratio": float(row["pe_ratio"]),
+                    "momentum_20d": float(row["momentum_20d"]),
+                    "volatility": float(row["volatility"]),
+                },
+                "factor_zscores": {
+                    "pe_ratio": pe_factor,
+                    "momentum_20d": momentum_factor,
+                    "volatility": volatility_factor,
+                },
+            }
+        ],
+    }
+
+
 def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
     raw_weights, applied_strategy = _raw_weights(payload)
     total_abs = sum(abs(v) for v in raw_weights.values())
@@ -184,12 +286,37 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
         for key, value in raw_weights.items()
     }
 
+    target_symbol = (payload.symbol or "").strip()
+    if (
+        applied_strategy is not None
+        and applied_strategy.id == SINGLE_STOCK_ONLY_STRATEGY_ID
+    ):
+        if not target_symbol:
+            raise ValueError("strategy 'single_stock_only' requires a non-empty symbol.")
+        normalized = _normalize_ticker_input(target_symbol)
+        from app.market_data import _is_etf_symbol
+        if _is_etf_symbol(normalized):
+            raise ValueError(
+                f"Symbol '{normalized}' is an ETF, which is not supported by "
+                "the current scoring pipeline (no PE ratio)."
+            )
+        result = _score_single_stock_only(normalized, weights)
+        result["applied_strategy"] = {
+            "id": applied_strategy.id,
+            "name": applied_strategy.name,
+            "description": applied_strategy.description,
+            "weights": {
+                key: round(value, 4)
+                for key, value in applied_strategy.weights().items()
+            },
+        }
+        return result
+
     dataset = load_dataset()
     scored = _rank_dataset(dataset, weights)
 
     mode = "market"
     on_demand_ensured: dict | None = None
-    target_symbol = (payload.symbol or "").strip()
     if target_symbol:
         mode = "single"
         normalized = _normalize_ticker_input(target_symbol)
