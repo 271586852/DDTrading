@@ -28,3 +28,4 @@ Thumbs.db
 
 # --- 日志 ---
 *.log
+backend/data/baostock_daily.parquet
