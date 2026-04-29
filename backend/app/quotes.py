@@ -13,12 +13,12 @@ from typing import Any
 
 import polars as pl
 
+from app.config import get_daily_parquet_path
 from app.market_data import (
     _is_etf_symbol,
     _is_stock_symbol,
     _normalize_symbol,
-    load_ashare_daily,
-    load_stock_names,
+    ensure_symbol_cached,
 )
 
 
@@ -26,8 +26,11 @@ DEFAULT_HISTORY_BARS = 120
 
 
 def _resolve_name(symbol: str) -> str | None:
+    path = get_daily_parquet_path().parent / "stock_names.parquet"
+    if not path.exists():
+        return None
     try:
-        names = load_stock_names()
+        names = pl.read_parquet(path)
     except Exception:  # noqa: BLE001  - 名称缺失不是致命错误
         return None
 
@@ -82,12 +85,36 @@ def fetch_quote(symbol: str, *, bars: int = DEFAULT_HISTORY_BARS) -> dict[str, A
     """
     normalized = _normalize_symbol(symbol)
 
-    daily = load_ashare_daily()
+    path = get_daily_parquet_path()
+    if path.exists():
+        daily = pl.read_parquet(path)
+    else:
+        daily = pl.DataFrame(
+            schema={
+                "date": pl.Datetime,
+                "open": pl.Float64,
+                "high": pl.Float64,
+                "low": pl.Float64,
+                "close": pl.Float64,
+                "volume": pl.Float64,
+                "symbol": pl.Utf8,
+            }
+        )
+
     sliced = (
         daily.filter(pl.col("symbol") == normalized)
         .sort("date")
         .tail(max(bars, 2))
     )
+    if sliced.height == 0 and _is_stock_symbol(normalized) and not _is_etf_symbol(normalized):
+        ensure_symbol_cached(normalized)
+        daily = pl.read_parquet(path)
+        sliced = (
+            daily.filter(pl.col("symbol") == normalized)
+            .sort("date")
+            .tail(max(bars, 2))
+        )
+
     if sliced.height == 0:
         raise KeyError(
             f"Symbol '{normalized}' has no daily bars in the parquet cache. "

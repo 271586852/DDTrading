@@ -201,7 +201,7 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
       const message =
         err instanceof ApiError
           ? err.status === 404
-            ? `代码 ${normalized} 不在本地缓存中，请先在后端执行 /refresh 刷新。`
+            ? `代码 ${normalized} 暂无可用行情（后端已尝试按需补单股）。请稍后重试或手动执行 /refresh。`
             : err.message
           : err instanceof Error
             ? err.message
@@ -235,7 +235,7 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
           // ETF detected server-side → degrade to etf-skip
           analysisMode = "etf-skip";
         } else if (err instanceof ApiError && err.status === 404) {
-          scoreError = `代码 ${normalized} 尚未在评分数据集中，可能还没刷 PE 或因子快照。`;
+          scoreError = `代码 ${normalized} 的评分因子仍不完整（后端已按需补单股），可能缺少 PE 或历史日线不足。`;
         } else {
           scoreError = err instanceof Error ? err.message : "评分失败";
         }
