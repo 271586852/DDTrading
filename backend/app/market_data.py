@@ -433,8 +433,8 @@ def fetch_daily_one(
     sources: Iterable[tuple[str, FetcherFn]] | None = None,
 ) -> pd.DataFrame:
     """按顺序尝试多个数据源，任意一个成功即返回。"""
-    if ak is None:
-        raise ModuleNotFoundError("akshare is not installed")
+    if ak is None and bs is None:
+        raise ModuleNotFoundError("neither baostock nor akshare is installed")
 
     last_exc: Exception | None = None
     for name, fetcher in sources or DATA_SOURCES:
@@ -542,8 +542,8 @@ def _build_daily_dataset(
     max_workers: int,
     universe: list[str] | None = None,
 ) -> pl.DataFrame:
-    if ak is None:
-        raise ModuleNotFoundError("akshare is not installed")
+    if ak is None and bs is None:
+        raise ModuleNotFoundError("neither baostock nor akshare is installed")
 
     end_date_str = datetime.now().strftime("%Y%m%d")
     start_date_str = (
@@ -593,16 +593,16 @@ def _build_daily_dataset(
     return pl.from_pandas(merged)
 
 
-def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
-    """加载股票池日线（A 股股票 + ETF）；必要时联网重建并写 parquet。"""
+def load_baostock_daily(*, refresh: bool = False) -> pl.DataFrame:
+    """加载 BaoStock 主导的股票池日线（A 股股票 + ETF）。"""
     from app.config import (
         get_akshare_max_workers,
         get_daily_cache_ttl_hours,
         get_daily_history_days,
-        get_daily_parquet_path,
+        get_baostock_daily_parquet_path,
     )
 
-    path = get_daily_parquet_path()
+    path = get_baostock_daily_parquet_path()
 
     with _CACHE_LOCK:
         if not refresh and _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
@@ -618,15 +618,20 @@ def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
         return dataset
 
 
+def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
+    """兼容旧接口名：内部已切换为 BaoStock 日线缓存。"""
+    return load_baostock_daily(refresh=refresh)
+
+
 # ---------------------------------------------------------------------------
 # 股票名称 & PE 快照
 # ---------------------------------------------------------------------------
 
 
 def _sibling_parquet(name: str) -> Path:
-    from app.config import get_daily_parquet_path
+    from app.config import get_baostock_daily_parquet_path
 
-    return get_daily_parquet_path().parent / name
+    return get_baostock_daily_parquet_path().parent / name
 
 
 def _stock_names_path() -> Path:
@@ -805,18 +810,24 @@ def _build_pe_snapshot(
 
 
 def load_pe_snapshot(*, refresh: bool = False) -> pl.DataFrame:
-    """加载 ``symbol / pe_ratio`` 快照；必要时联网重建并写 parquet。"""
-    from app.config import get_akshare_max_workers, get_daily_cache_ttl_hours
+    """加载 ``symbol / pe_ratio`` 快照（只读本地，不自动联网拉取）。"""
+    del refresh
+    from app.config import get_daily_cache_ttl_hours
 
     path = _pe_snapshot_path()
 
     with _CACHE_LOCK:
-        if not refresh and _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
+        if _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
             return pl.read_parquet(path)
-
-        dataset = _build_pe_snapshot(max_workers=get_akshare_max_workers())
-        _write_parquet_atomic(dataset, path)
-        return dataset
+        if path.exists():
+            return pl.read_parquet(path)
+        return pl.DataFrame(
+            schema={
+                "symbol": pl.Utf8,
+                "pe_ratio": pl.Float64,
+                "updated_at": pl.Utf8,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1030,11 +1041,7 @@ def _refresh_market_data_incremental() -> dict[str, object]:
         else:
             daily = existing
 
-        names, names_summary = _update_stock_names_incremental(universe)
-        pe_snapshot, pe_summary = _build_pe_snapshot_incremental(
-            max_workers=max_workers,
-            universe=universe,
-        )
+        _names, names_summary = _update_stock_names_incremental(universe)
 
     return {
         "mode": "incremental",
@@ -1047,7 +1054,11 @@ def _refresh_market_data_incremental() -> dict[str, object]:
             "path": str(path),
         },
         "names": names_summary,
-        "pe": pe_summary,
+        "pe": {
+            "status": "skipped",
+            "reason": "auto PE refresh disabled",
+            "path": str(_pe_snapshot_path()),
+        },
     }
 
 
@@ -1067,9 +1078,8 @@ def refresh_market_data(*, mode: str = "full") -> dict[str, object]:
     if mode != "full":
         raise ValueError("refresh mode must be either 'full' or 'incremental'")
 
-    daily = load_ashare_daily(refresh=True)
+    daily = load_baostock_daily(refresh=True)
     names = load_stock_names(refresh=True)
-    pe_snapshot = load_pe_snapshot(refresh=True)
 
     return {
         "mode": "full",
@@ -1083,7 +1093,8 @@ def refresh_market_data(*, mode: str = "full") -> dict[str, object]:
             "path": str(_stock_names_path()),
         },
         "pe": {
-            "rows": pe_snapshot.height,
+            "status": "skipped",
+            "reason": "auto PE refresh disabled",
             "path": str(_pe_snapshot_path()),
         },
     }
@@ -1152,14 +1163,14 @@ def ensure_symbol_cached(
     days: int = 365,
     adjust: str = "qfq",
 ) -> dict[str, object]:
-    """按需把单只股票的 daily / PE / 名称增量写入三张 parquet 缓存。
+    """按需把单只股票的 daily / 名称增量写入本地 parquet 缓存。
 
     用于 ``/score`` 单股路径冷命中时按需补齐——不重建全市场，只追加/覆盖这一只。
 
     - 非股票池代码（北交所或非法）→ ``ValueError``
     - ETF → ``ValueError``（评分管线不支持 ETF）
     - daily 拉不到 → 上抛 ``RuntimeError``（多源 fallback 都失败）
-    - PE 拉不到 → 不致命，只落 daily/name；上层评分会因缺 PE 继续 404
+    - PE 自动拉取默认关闭：不会在此函数内联网抓取 PE
     """
     code = _normalize_symbol(symbol)
 
@@ -1183,33 +1194,24 @@ def ensure_symbol_cached(
         raise RuntimeError(f"fetched daily is empty for {code}")
     new_daily = pl.from_pandas(daily_pd)
 
-    try:
-        pe_value = _fetch_pe_one(code)
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("pe fetch failed for %s: %s", code, exc)
-        pe_value = None
-
     name = _fetch_single_stock_name(code)
 
     with _CACHE_LOCK:
         daily_rows = _upsert_daily(new_daily, code)
-        if pe_value is not None:
-            _upsert_pe(code, pe_value)
         if name:
             _upsert_name(code, name)
 
     LOGGER.info(
-        "ensure_symbol_cached: %s -> daily=%d rows, pe=%s, name=%r",
+        "ensure_symbol_cached: %s -> daily=%d rows, name=%r",
         code,
         daily_rows,
-        pe_value,
         name,
     )
 
     return {
         "symbol": code,
         "daily_rows": daily_rows,
-        "pe_ratio": pe_value,
+        "pe_ratio": None,
         "name": name,
         "window": {"start": start_date_str, "end": end_date_str},
     }
@@ -1217,7 +1219,7 @@ def ensure_symbol_cached(
 
 def refresh_ashare_daily() -> dict[str, int | str]:
     """仅刷新日线 parquet（不触发 PE/名称刷新）。"""
-    dataset = load_ashare_daily(refresh=True)
+    dataset = load_baostock_daily(refresh=True)
     return {
         "rows": dataset.height,
         "symbols": dataset.select(pl.col("symbol").n_unique()).item(),
@@ -1226,6 +1228,6 @@ def refresh_ashare_daily() -> dict[str, int | str]:
 
 
 def _resolve_parquet_path() -> Path:
-    from app.config import get_daily_parquet_path
+    from app.config import get_baostock_daily_parquet_path
 
-    return get_daily_parquet_path()
+    return get_baostock_daily_parquet_path()
