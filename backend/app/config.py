@@ -17,7 +17,6 @@ DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
 DEFAULT_FRONTEND_ORIGIN = DEFAULT_FRONTEND_ORIGINS[0]
 DEFAULT_TUSHARE_UNIVERSE_SIZE = 300
 DEFAULT_TUSHARE_MAX_WORKERS = 8
-DEFAULT_TUSHARE_CACHE_TTL_SECONDS = 600
 DEFAULT_DAILY_HISTORY_DAYS = 3650
 DEFAULT_DAILY_CACHE_TTL_HOURS = 24
 
@@ -65,14 +64,6 @@ def get_tushare_max_workers() -> int:
     )
 
 
-def get_tushare_cache_ttl_seconds() -> int:
-    return _get_int_env(
-        "DDTRADING_TUSHARE_CACHE_TTL_SECONDS",
-        default=DEFAULT_TUSHARE_CACHE_TTL_SECONDS,
-        minimum=0,
-    )
-
-
 def get_daily_parquet_path() -> Path:
     """本地全市场日线 parquet 的存储路径。"""
     raw_path = os.getenv("DDTRADING_DAILY_PARQUET_PATH")
@@ -107,7 +98,7 @@ def get_akshare_max_workers() -> int:
 
 
 def get_akshare_cache_ttl_seconds() -> int:
-    return get_tushare_cache_ttl_seconds()
+    return 0
 
 
 def get_daily_history_days() -> int:

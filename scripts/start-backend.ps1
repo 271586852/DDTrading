@@ -3,7 +3,6 @@ param(
     [int]$Port = 8011,
     [Nullable[int]]$TushareUniverseSize = $null,
     [Nullable[int]]$TushareMaxWorkers = $null,
-    [Nullable[int]]$TushareCacheTtlSeconds = $null,
     [string]$TushareToken = "",
     [string]$CorsOrigins = ""
 )
@@ -45,9 +44,6 @@ if ($TushareUniverseSize -ne $null) {
 }
 if ($TushareMaxWorkers -ne $null) {
     $env:DDTRADING_TUSHARE_MAX_WORKERS = "$TushareMaxWorkers"
-}
-if ($TushareCacheTtlSeconds -ne $null) {
-    $env:DDTRADING_TUSHARE_CACHE_TTL_SECONDS = "$TushareCacheTtlSeconds"
 }
 
 if ($TushareToken) {

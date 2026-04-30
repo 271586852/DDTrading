@@ -91,14 +91,13 @@ def load_tushare_dataset(
     universe_size: int,
     history_days: int | None = None,  # 保留签名兼容，不再生效
     max_workers: int | None = None,   # 保留签名兼容，不再生效
-    cache_ttl_seconds: int | None = None,  # 保留签名兼容，不再生效
 ) -> pl.DataFrame:
     """组装评分宽表（纯读 parquet，不联网）。
 
     若对应 parquet 不存在或已过期，会联网重建；期望常规情况下由
     ``/refresh`` 端点提前触发。
     """
-    del history_days, max_workers, cache_ttl_seconds  # 仅为了签名兼容
+    del history_days, max_workers  # 仅为了签名兼容
 
     daily = load_ashare_daily()
     names = load_stock_names()
@@ -131,11 +130,9 @@ def load_akshare_dataset(
     universe_size: int,
     history_days: int | None = None,
     max_workers: int | None = None,
-    cache_ttl_seconds: int | None = None,
 ) -> pl.DataFrame:
     return load_tushare_dataset(
         universe_size=universe_size,
         history_days=history_days,
         max_workers=max_workers,
-        cache_ttl_seconds=cache_ttl_seconds,
     )
