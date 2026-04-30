@@ -20,7 +20,7 @@ from typing import Any
 import pandas as pd
 import polars as pl
 
-from app.market_data import load_ashare_daily
+from app.market_data import load_ashare_daily, refresh_market_data
 from app.schemas import (
     BacktestDateRange,
     BacktestMetrics,
@@ -276,6 +276,20 @@ def _resolve_symbol_window(
     return window, start_eff, end_eff
 
 
+def _ensure_backtest_window_cached(symbol: str, start_req: date, end_req: date) -> None:
+    """本地优先；若区间不完整则先做增量更新再回测。"""
+    daily = load_ashare_daily()
+    sub = daily.filter(pl.col("symbol") == symbol).sort("date")
+    if sub.height == 0:
+        refresh_market_data(mode="incremental")
+        return
+
+    data_min = _to_date(sub.select(pl.col("date").min()).item())
+    data_max = _to_date(sub.select(pl.col("date").max()).item())
+    if data_min > start_req or data_max < end_req:
+        refresh_market_data(mode="incremental")
+
+
 def run_single_symbol_backtest(
     request: BacktestRequest,
     *,
@@ -285,6 +299,7 @@ def run_single_symbol_backtest(
     from akquant import run_backtest
 
     symbol = request.symbol.zfill(6)
+    _ensure_backtest_window_cached(symbol, request.start_date, request.end_date)
 
     data, start_eff, end_eff = _resolve_symbol_window(
         symbol=symbol,
@@ -356,6 +371,7 @@ def export_single_symbol_backtest_report(
     from akquant import run_backtest
 
     symbol = request.symbol.zfill(6)
+    _ensure_backtest_window_cached(symbol, request.start_date, request.end_date)
     data, start_eff, end_eff = _resolve_symbol_window(
         symbol=symbol,
         start_req=request.start_date,
