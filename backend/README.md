@@ -20,6 +20,8 @@ Or from repo root:
 .\scripts\start-backend.ps1
 ```
 
+Default config is loaded from `backend/.env` when using the script.
+
 ## Data Source
 
 The backend now uses Tushare as the only online data source.
@@ -38,6 +40,8 @@ DDTRADING_TUSHARE_MAX_WORKERS=8
 DDTRADING_TUSHARE_CACHE_TTL_SECONDS=600
 DDTRADING_TUSHARE_DAILY_PARQUET_PATH=./data/tushare_daily.parquet
 ```
+
+Create `backend/.env` directly and fill values from the sections above.
 
 ## Generate Mock Data
 

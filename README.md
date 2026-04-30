@@ -104,18 +104,16 @@ NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8011
 
 ### 后端
 
-可选环境变量：
+在 `backend/.env` 中配置：
 
 ```env
-DDTRADING_DATA_PATH=./data/mock_data.parquet
-DDTRADING_CORS_ORIGINS=http://127.0.0.1:3000
+TUSHARE_TOKEN=your_tushare_token_here
+DDTRADING_CORS_ORIGINS=http://127.0.0.1:3010,http://localhost:3010
 ```
-
-示例文件见 `backend/.env.example`。
 
 说明：
 
-- `DDTRADING_DATA_PATH` 用于切换本地 Parquet 数据源
+- `TUSHARE_TOKEN` 为后端抓取真实行情所需令牌
 - `DDTRADING_CORS_ORIGINS` 支持逗号分隔多个前端来源
 
 ## 前后端联调约定
