@@ -7,12 +7,10 @@ import logging
 import polars as pl
 
 from app.config import (
-    get_tushare_cache_ttl_seconds,
     get_tushare_max_workers,
-    get_tushare_universe_size,
 )
 from app.schemas import ScoreRequest
-from app.strategies import ScoringStrategy, get_strategy
+from app.strategies import ScoringStrategy, get_strategy, get_strategy_lookback_days
 
 
 FACTOR_COLUMNS = {
@@ -83,7 +81,6 @@ def load_dataset() -> pl.DataFrame:
         universe_size=0,
         history_days=None,
         max_workers=get_tushare_max_workers(),
-        cache_ttl_seconds=get_tushare_cache_ttl_seconds(),
     )
     return _validate_dataset(dataset, source_name="tushare")
 
@@ -143,23 +140,28 @@ def _rank_dataset(dataset: pl.DataFrame, weights: Dict[str, float]) -> pl.DataFr
     return scored
 
 
-def _build_single_symbol_dataset(symbol: str) -> pl.DataFrame:
+def _build_single_symbol_dataset(symbol: str, *, lookback_days: int = 20) -> pl.DataFrame:
     from app.market_data import ensure_symbol_cached, load_ashare_daily, load_pe_snapshot, load_stock_names
 
-    ensure_symbol_cached(symbol)
+    # 本地优先；仅在本地不足时按策略需求补拉单股并写回本地。
+    ensure_symbol_cached(symbol, days=max(lookback_days + 5, 30))
 
     daily = load_ashare_daily()
     one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
-    if one_daily.height < 21:
-        raise KeyError(f"Symbol '{symbol}' has insufficient daily bars for single-stock scoring.")
+    min_rows = lookback_days + 1
+    if one_daily.height < min_rows:
+        raise KeyError(
+            f"Symbol '{symbol}' has insufficient daily bars for single-stock scoring "
+            f"(need >= {min_rows}, got {one_daily.height})."
+        )
 
     prepared = one_daily.with_columns(
         pl.col("close").pct_change().alias("daily_return")
     )
     factor_row = prepared.select(
         [
-            (pl.col("close").last() / pl.col("close").shift(20).last() - 1.0).alias("momentum_20d"),
-            pl.col("daily_return").tail(20).std(ddof=0).alias("volatility"),
+            (pl.col("close").last() / pl.col("close").shift(lookback_days).last() - 1.0).alias("momentum_20d"),
+            pl.col("daily_return").tail(lookback_days).std(ddof=0).alias("volatility"),
             pl.col("daily_return").drop_nulls().count().alias("valid_returns"),
         ]
     ).to_dicts()[0]
@@ -167,7 +169,7 @@ def _build_single_symbol_dataset(symbol: str) -> pl.DataFrame:
     momentum_20d = factor_row["momentum_20d"]
     volatility = factor_row["volatility"]
     valid_returns = int(factor_row["valid_returns"] or 0)
-    if momentum_20d is None or volatility is None or valid_returns < 20:
+    if momentum_20d is None or volatility is None or valid_returns < lookback_days:
         raise KeyError(f"Symbol '{symbol}' has incomplete factor data for single-stock scoring.")
 
     pe_snapshot = load_pe_snapshot()
@@ -200,8 +202,10 @@ def _build_single_symbol_dataset(symbol: str) -> pl.DataFrame:
 def _score_single_stock_only(
     symbol: str,
     weights: Dict[str, float],
+    *,
+    lookback_days: int,
 ) -> dict[str, object]:
-    dataset = _build_single_symbol_dataset(symbol)
+    dataset = _build_single_symbol_dataset(symbol, lookback_days=lookback_days)
     row = dataset.to_dicts()[0]
 
     # 单股模式下没有横截面对比，采用稳定单调映射得到可解释的 0~100 分。
@@ -252,6 +256,13 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
     }
 
     target_symbol = (payload.symbol or "").strip()
+    lookback_days = get_strategy_lookback_days(payload.strategy_id)
+
+    # 全市场分析：默认先增量更新再分析。
+    if not target_symbol:
+        from app.market_data import refresh_market_data
+        refresh_market_data(mode="incremental")
+
     if (
         applied_strategy is not None
         and applied_strategy.id == SINGLE_STOCK_ONLY_STRATEGY_ID
@@ -265,7 +276,11 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
                 f"Symbol '{normalized}' is an ETF, which is not supported by "
                 "the current scoring pipeline (no PE ratio)."
             )
-        result = _score_single_stock_only(normalized, weights)
+        result = _score_single_stock_only(
+            normalized,
+            weights,
+            lookback_days=lookback_days,
+        )
         result["applied_strategy"] = {
             "id": applied_strategy.id,
             "name": applied_strategy.name,
@@ -301,7 +316,10 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
                 normalized,
             )
             try:
-                on_demand_ensured = ensure_symbol_cached(normalized)
+                on_demand_ensured = ensure_symbol_cached(
+                    normalized,
+                    days=max(lookback_days + 5, 30),
+                )
             except ValueError:
                 raise
             except Exception as exc:  # noqa: BLE001

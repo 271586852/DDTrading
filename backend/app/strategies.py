@@ -25,6 +25,7 @@ class ScoringStrategy:
     pe_weight: float
     momentum_weight: float
     volatility_weight: float
+    lookback_days: int = 20
 
     def weights(self) -> dict[str, float]:
         return {
@@ -45,6 +46,7 @@ _STRATEGY_LIST: tuple[ScoringStrategy, ...] = (
         pe_weight=-0.34,
         momentum_weight=0.33,
         volatility_weight=-0.33,
+        lookback_days=20,
     ),
     ScoringStrategy(
         id="value",
@@ -56,6 +58,7 @@ _STRATEGY_LIST: tuple[ScoringStrategy, ...] = (
         pe_weight=-0.70,
         momentum_weight=0.20,
         volatility_weight=-0.10,
+        lookback_days=20,
     ),
     ScoringStrategy(
         id="momentum",
@@ -67,6 +70,7 @@ _STRATEGY_LIST: tuple[ScoringStrategy, ...] = (
         pe_weight=-0.15,
         momentum_weight=0.70,
         volatility_weight=-0.15,
+        lookback_days=60,
     ),
     ScoringStrategy(
         id="low_volatility",
@@ -78,6 +82,7 @@ _STRATEGY_LIST: tuple[ScoringStrategy, ...] = (
         pe_weight=-0.25,
         momentum_weight=0.15,
         volatility_weight=-0.60,
+        lookback_days=40,
     ),
     ScoringStrategy(
         id="growth",
@@ -88,6 +93,7 @@ _STRATEGY_LIST: tuple[ScoringStrategy, ...] = (
         pe_weight=-0.10,
         momentum_weight=0.55,
         volatility_weight=-0.35,
+        lookback_days=60,
     ),
     ScoringStrategy(
         id="single_stock_only",
@@ -98,6 +104,7 @@ _STRATEGY_LIST: tuple[ScoringStrategy, ...] = (
         pe_weight=-0.34,
         momentum_weight=0.33,
         volatility_weight=-0.33,
+        lookback_days=60,
     ),
 )
 
@@ -124,3 +131,10 @@ def get_strategy(strategy_id: str) -> ScoringStrategy:
 
 def strategy_exists(strategy_id: str) -> bool:
     return strategy_id in _STRATEGY_MAP
+
+
+def get_strategy_lookback_days(strategy_id: str | None) -> int:
+    """返回策略建议的历史窗口天数（交易日）。"""
+    if not strategy_id:
+        return 20
+    return get_strategy(strategy_id).lookback_days
