@@ -1,12 +1,10 @@
 param(
     [string]$HostAddress = "127.0.0.1",
     [int]$Port = 8011,
-    [string]$DataPath = "",
-    [string]$DataSource = "auto",
-    [int]$AkshareUniverseSize = 300,
-    [int]$AkshareHistoryDays = 120,
-    [int]$AkshareMaxWorkers = 8,
-    [int]$AkshareCacheTtlSeconds = 600,
+    [int]$TushareUniverseSize = 300,
+    [int]$TushareMaxWorkers = 8,
+    [int]$TushareCacheTtlSeconds = 600,
+    [string]$TushareToken = "",
     [string]$CorsOrigins = "http://127.0.0.1:3000,http://localhost:3000"
 )
 
@@ -20,14 +18,12 @@ if (-not (Test-Path $backendRoot)) {
 }
 
 $env:DDTRADING_CORS_ORIGINS = $CorsOrigins
-$env:DDTRADING_DATA_SOURCE = $DataSource
-$env:DDTRADING_AKSHARE_UNIVERSE_SIZE = "$AkshareUniverseSize"
-$env:DDTRADING_AKSHARE_HISTORY_DAYS = "$AkshareHistoryDays"
-$env:DDTRADING_AKSHARE_MAX_WORKERS = "$AkshareMaxWorkers"
-$env:DDTRADING_AKSHARE_CACHE_TTL_SECONDS = "$AkshareCacheTtlSeconds"
+$env:DDTRADING_TUSHARE_UNIVERSE_SIZE = "$TushareUniverseSize"
+$env:DDTRADING_TUSHARE_MAX_WORKERS = "$TushareMaxWorkers"
+$env:DDTRADING_TUSHARE_CACHE_TTL_SECONDS = "$TushareCacheTtlSeconds"
 
-if ($DataPath) {
-    $env:DDTRADING_DATA_PATH = $DataPath
+if ($TushareToken) {
+    $env:TUSHARE_TOKEN = $TushareToken
 }
 
 Set-Location $backendRoot
