@@ -7,12 +7,9 @@ import logging
 import polars as pl
 
 from app.config import (
-    get_akshare_cache_ttl_seconds,
-    get_akshare_history_days,
-    get_akshare_max_workers,
-    get_akshare_universe_size,
-    get_data_path,
-    get_data_source,
+    get_tushare_cache_ttl_seconds,
+    get_tushare_max_workers,
+    get_tushare_universe_size,
 )
 from app.schemas import ScoreRequest
 from app.strategies import ScoringStrategy, get_strategy
@@ -79,48 +76,16 @@ def _scale_scores_to_100(frame: pl.DataFrame, score_column: str) -> pl.DataFrame
 
 
 def load_dataset() -> pl.DataFrame:
-    data_source = get_data_source()
+    # 评分宽表统一来自 Tushare 驱动的 parquet 组装层。
+    from app.akshare_loader import load_tushare_dataset
 
-    if data_source == "parquet":
-        return _load_dataset_from_parquet()
-
-    if data_source == "akshare":
-        return _load_dataset_from_akshare()
-
-    # auto mode: prefer AKShare, fallback to local parquet when network/data source fails
-    try:
-        return _load_dataset_from_akshare()
-    except Exception as ak_exc:
-        LOGGER.warning(
-            "AKShare dataset load failed in auto mode (%s). Fallback to parquet.",
-            type(ak_exc).__name__,
-        )
-        return _load_dataset_from_parquet()
-
-
-def _load_dataset_from_parquet() -> pl.DataFrame:
-    data_path = get_data_path()
-    if not data_path.exists():
-        raise FileNotFoundError(
-            f"Mock dataset not found at '{data_path}'. Run the generator script first."
-        )
-    dataset = pl.read_parquet(data_path)
-    return _validate_dataset(dataset, source_name="parquet")
-
-
-def _load_dataset_from_akshare() -> pl.DataFrame:
-    from app.akshare_loader import load_akshare_dataset
-
-    # universe_size=0 → 不做字典序截断，全市场进评分。
-    # 历史上这里是用来限流网络请求的，现在数据源是 parquet，截断只会
-    # 让靠后字典序（如 6xx/688 科创板）永远进不了排行榜。
-    dataset = load_akshare_dataset(
+    dataset = load_tushare_dataset(
         universe_size=0,
-        history_days=get_akshare_history_days(),
-        max_workers=get_akshare_max_workers(),
-        cache_ttl_seconds=get_akshare_cache_ttl_seconds(),
+        history_days=None,
+        max_workers=get_tushare_max_workers(),
+        cache_ttl_seconds=get_tushare_cache_ttl_seconds(),
     )
-    return _validate_dataset(dataset, source_name="akshare")
+    return _validate_dataset(dataset, source_name="tushare")
 
 
 def _validate_dataset(dataset: pl.DataFrame, source_name: str) -> pl.DataFrame:

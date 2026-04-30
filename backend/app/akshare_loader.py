@@ -1,4 +1,4 @@
-"""评分宽表组装层。
+"""评分宽表组装层（Tushare 缓存版）。
 
 从 :mod:`app.market_data` 维护的三张 parquet
 （``ashare_daily`` / ``stock_names`` / ``pe_snapshot``）中读取数据，计算出评分
@@ -7,7 +7,7 @@
 
     ticker / name / pe_ratio / momentum_20d / volatility
 
-该模块不再直接访问 AKShare 网络接口——数据刷新全部通过 ``/refresh`` 入口驱动。
+该模块不直接联网；数据刷新通过 ``/refresh`` 入口驱动。
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import logging
 
 import polars as pl
 
-from app.market_data import load_baostock_daily, load_pe_snapshot, load_stock_names
+from app.market_data import load_ashare_daily, load_pe_snapshot, load_stock_names
 
 
 LOGGER = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ def _assemble(
     return joined
 
 
-def load_akshare_dataset(
+def load_tushare_dataset(
     universe_size: int,
     history_days: int | None = None,  # 保留签名兼容，不再生效
     max_workers: int | None = None,   # 保留签名兼容，不再生效
@@ -100,7 +100,7 @@ def load_akshare_dataset(
     """
     del history_days, max_workers, cache_ttl_seconds  # 仅为了签名兼容
 
-    daily = load_baostock_daily()
+    daily = load_ashare_daily()
     names = load_stock_names()
     pe_snapshot = load_pe_snapshot()
 
@@ -119,8 +119,23 @@ def load_akshare_dataset(
         )
 
     LOGGER.info(
-        "akshare dataset assembled: %d tickers (universe_size=%s)",
+        "tushare dataset assembled: %d tickers (universe_size=%s)",
         dataset.height,
         universe_size,
     )
     return dataset
+
+
+# Backward-compatible alias.
+def load_akshare_dataset(
+    universe_size: int,
+    history_days: int | None = None,
+    max_workers: int | None = None,
+    cache_ttl_seconds: int | None = None,
+) -> pl.DataFrame:
+    return load_tushare_dataset(
+        universe_size=universe_size,
+        history_days=history_days,
+        max_workers=max_workers,
+        cache_ttl_seconds=cache_ttl_seconds,
+    )

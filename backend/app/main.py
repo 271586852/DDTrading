@@ -29,7 +29,7 @@ app = FastAPI(
     version="0.2.0",
     description=(
         "Backend API for multi-factor A-share ranking and single-symbol "
-        "backtesting, backed by a local parquet cache built from AKShare."
+        "backtesting, backed by a local parquet cache built from Tushare."
     ),
 )
 
