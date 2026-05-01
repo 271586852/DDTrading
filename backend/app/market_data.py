@@ -288,8 +288,8 @@ def _build_daily_dataset(
     return pl.from_pandas(merged)
 
 
-def load_baostock_daily(*, refresh: bool = False) -> pl.DataFrame:
-    """兼容旧接口名：读取/重建 tushare 日线缓存。"""
+def load_tushare_daily(*, refresh: bool = False) -> pl.DataFrame:
+    """读取/重建 Tushare 日线缓存。"""
     path = get_tushare_daily_parquet_path()
 
     with _CACHE_LOCK:
@@ -304,12 +304,6 @@ def load_baostock_daily(*, refresh: bool = False) -> pl.DataFrame:
         )
         _write_parquet_atomic(dataset, path)
         return dataset
-
-
-def load_ashare_daily(*, refresh: bool = False) -> pl.DataFrame:
-    """兼容旧接口名：内部已切换为 Tushare 日线缓存。"""
-    return load_baostock_daily(refresh=refresh)
-
 
 # ---------------------------------------------------------------------------
 # 股票名称 & PE 快照
@@ -381,10 +375,13 @@ def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
 def _fetch_pe_one(symbol: str) -> float | None:
     """逐只拉取最新 PE，优先 PE_TTM。"""
     pro = _get_pro()
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
     raw = pro.daily_basic(
         ts_code=_to_ts_code(symbol),
+        start_date=start_date,
+        end_date=end_date,
         fields="trade_date,pe_ttm,pe",
-        limit=5,
     )
     if raw is None or raw.empty:
         return None
@@ -697,7 +694,7 @@ def refresh_market_data(*, mode: str = "full") -> dict[str, object]:
     if mode != "full":
         raise ValueError("refresh mode must be either 'full' or 'incremental'")
 
-    daily = load_baostock_daily(refresh=True)
+    daily = load_tushare_daily(refresh=True)
     names = load_stock_names(refresh=True)
 
     return {
@@ -748,7 +745,13 @@ def _upsert_daily(new_daily: pl.DataFrame, symbol: str) -> int:
 
 def _upsert_pe(symbol: str, pe_value: float) -> None:
     path = _pe_snapshot_path()
-    row = pl.DataFrame({"symbol": [symbol], "pe_ratio": [pe_value]})
+    row = pl.DataFrame(
+        {
+            "symbol": [symbol],
+            "pe_ratio": [pe_value],
+            "updated_at": [datetime.now().isoformat(timespec="seconds")],
+        }
+    )
     if path.exists():
         existing = pl.read_parquet(path)
         merged = pl.concat(
@@ -836,9 +839,9 @@ def ensure_symbol_cached(
     }
 
 
-def refresh_ashare_daily() -> dict[str, int | str]:
+def refresh_tushare_daily() -> dict[str, int | str]:
     """仅刷新日线 parquet（不触发 PE/名称刷新）。"""
-    dataset = load_baostock_daily(refresh=True)
+    dataset = load_tushare_daily(refresh=True)
     return {
         "rows": dataset.height,
         "symbols": dataset.select(pl.col("symbol").n_unique()).item(),

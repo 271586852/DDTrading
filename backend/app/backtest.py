@@ -20,7 +20,7 @@ from typing import Any
 import pandas as pd
 import polars as pl
 
-from app.market_data import load_ashare_daily, refresh_market_data
+from app.market_data import load_tushare_daily, refresh_market_data
 from app.schemas import (
     BacktestDateRange,
     BacktestMetrics,
@@ -242,7 +242,7 @@ def _resolve_symbol_window(
     end_req: date,
 ) -> tuple[pd.DataFrame, date, date]:
     """读 parquet → 过滤 symbol → clamp 到数据可用区间 → 返回 pandas 子集。"""
-    daily = load_ashare_daily()
+    daily = load_tushare_daily()
     sub = daily.filter(pl.col("symbol") == symbol).sort("date")
     if sub.height == 0:
         raise KeyError(
@@ -278,7 +278,7 @@ def _resolve_symbol_window(
 
 def _ensure_backtest_window_cached(symbol: str, start_req: date, end_req: date) -> None:
     """本地优先；若区间不完整则先做增量更新再回测。"""
-    daily = load_ashare_daily()
+    daily = load_tushare_daily()
     sub = daily.filter(pl.col("symbol") == symbol).sort("date")
     if sub.height == 0:
         refresh_market_data(mode="incremental")

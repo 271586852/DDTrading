@@ -6,7 +6,6 @@ from pathlib import Path
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_PATH = BACKEND_ROOT / "data" / "mock_data.parquet"
-DEFAULT_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "ashare_daily.parquet"
 DEFAULT_TUSHARE_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "tushare_daily.parquet"
 DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
     "http://127.0.0.1:3000",
@@ -64,41 +63,12 @@ def get_tushare_max_workers() -> int:
     )
 
 
-def get_daily_parquet_path() -> Path:
-    """本地全市场日线 parquet 的存储路径。"""
-    raw_path = os.getenv("DDTRADING_DAILY_PARQUET_PATH")
-    if not raw_path:
-        return DEFAULT_DAILY_PARQUET_PATH
-    return Path(raw_path).expanduser().resolve()
-
-
 def get_tushare_daily_parquet_path() -> Path:
     """Tushare 日线 parquet 的存储路径。"""
     raw_path = os.getenv("DDTRADING_TUSHARE_DAILY_PARQUET_PATH")
     if not raw_path:
         return DEFAULT_TUSHARE_DAILY_PARQUET_PATH
     return Path(raw_path).expanduser().resolve()
-
-
-# Backward-compatible aliases used by existing modules.
-def get_baostock_daily_parquet_path() -> Path:
-    return get_tushare_daily_parquet_path()
-
-
-def get_akshare_universe_size() -> int:
-    return get_tushare_universe_size()
-
-
-def get_akshare_history_days() -> int:
-    return get_daily_history_days()
-
-
-def get_akshare_max_workers() -> int:
-    return get_tushare_max_workers()
-
-
-def get_akshare_cache_ttl_seconds() -> int:
-    return 0
 
 
 def get_daily_history_days() -> int:
