@@ -51,15 +51,18 @@ function Stop-ProcessUsingPort {
 Stop-ProcessUsingPort -Port $BackendPort
 Stop-ProcessUsingPort -Port $FrontendPort
 
-Start-Process powershell -ArgumentList @(
+$backendArgs = @(
     "-NoExit",
     "-ExecutionPolicy", "Bypass",
     "-File", "`"$backendScript`"",
     "-HostAddress", $HostAddress,
     "-Port", $BackendPort,
-    "-TushareToken", $TushareToken,
     "-CorsOrigins", $corsOrigins
 )
+if (-not [string]::IsNullOrWhiteSpace($TushareToken)) {
+    $backendArgs += @("-TushareToken", $TushareToken)
+}
+Start-Process powershell -ArgumentList $backendArgs
 
 Start-Sleep -Seconds 2
 
