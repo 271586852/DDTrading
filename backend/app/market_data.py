@@ -653,6 +653,18 @@ def _refresh_market_data_incremental() -> dict[str, object]:
             daily = existing
 
         _names, names_summary = _update_stock_names_incremental(universe)
+        try:
+            _pe, pe_summary = _build_pe_snapshot_incremental(
+                max_workers=max_workers,
+                universe=universe,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("incremental PE refresh failed: %s", exc)
+            pe_summary = {
+                "status": "failed",
+                "error": str(exc),
+                "path": str(_pe_snapshot_path()),
+            }
 
     return {
         "mode": "incremental",
@@ -665,11 +677,7 @@ def _refresh_market_data_incremental() -> dict[str, object]:
             "path": str(path),
         },
         "names": names_summary,
-        "pe": {
-            "status": "skipped",
-            "reason": "auto PE refresh disabled",
-            "path": str(_pe_snapshot_path()),
-        },
+        "pe": pe_summary,
     }
 
 
