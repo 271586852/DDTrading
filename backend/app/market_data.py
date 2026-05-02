@@ -358,8 +358,6 @@ def _fetch_stock_names() -> pd.DataFrame:
 
 def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
     """加载 ``symbol / name`` 快照（股票池 = 股票 + ETF）。"""
-    from app.config import get_daily_cache_ttl_hours
-
     path = _stock_names_path()
 
     with _CACHE_LOCK:

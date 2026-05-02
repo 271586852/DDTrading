@@ -5,7 +5,6 @@ from pathlib import Path
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATA_PATH = BACKEND_ROOT / "data" / "mock_data.parquet"
 DEFAULT_TUSHARE_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "tushare_daily.parquet"
 DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
     "http://127.0.0.1:3000",
@@ -18,13 +17,6 @@ DEFAULT_TUSHARE_UNIVERSE_SIZE = 300
 DEFAULT_TUSHARE_MAX_WORKERS = 8
 DEFAULT_DAILY_HISTORY_DAYS = 3650
 DEFAULT_DAILY_CACHE_TTL_HOURS = 24
-
-
-def get_data_path() -> Path:
-    raw_path = os.getenv("DDTRADING_DATA_PATH")
-    if not raw_path:
-        return DEFAULT_DATA_PATH
-    return Path(raw_path).expanduser().resolve()
 
 
 def get_tushare_token() -> str:
