@@ -36,13 +36,13 @@ function Stop-ProcessUsingPort {
             Select-Object -Unique
     }
 
-    foreach ($pid in $pids) {
-        if ($pid -gt 0 -and $pid -ne $PID) {
+    foreach ($processId in $pids) {
+        if ($processId -gt 0 -and $processId -ne $PID) {
             try {
-                Stop-Process -Id $pid -Force -ErrorAction Stop
-                Write-Host "Killed process $pid on port $Port"
+                Stop-Process -Id $processId -Force -ErrorAction Stop
+                Write-Host "Killed process $processId on port $Port"
             } catch {
-                Write-Warning "Failed to kill process $pid on port ${Port}: $($_.Exception.Message)"
+                Write-Warning "Failed to kill process $processId on port ${Port}: $($_.Exception.Message)"
             }
         }
     }
