@@ -39,6 +39,18 @@ export type ScoreResponse = {
   applied_strategy?: StrategyInfo | null;
 };
 
+export type MarketScoreJobStarted = {
+  job_id: string;
+};
+
+export type MarketScoreJobStatus = {
+  status: "pending" | "running" | "completed" | "failed";
+  progress: number;
+  stage: string;
+  result?: ScoreResponse | null;
+  error?: string | null;
+};
+
 export type QuoteCandle = {
   date: string | null;
   open: number | null;

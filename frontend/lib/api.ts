@@ -5,6 +5,8 @@ import type {
   TradeStrategyInfo,
 } from "@/types/backtest";
 import type {
+  MarketScoreJobStarted,
+  MarketScoreJobStatus,
   QuoteResponse,
   RefreshMode,
   RefreshResponse,
@@ -63,6 +65,23 @@ export function scoreMarket(strategyId: string): Promise<ScoreResponse> {
     method: "POST",
     body: JSON.stringify({ strategy_id: strategyId }),
   });
+}
+
+export function startMarketScoreJob(
+  strategyId: string,
+): Promise<MarketScoreJobStarted> {
+  return request<MarketScoreJobStarted>("/score/market-job", {
+    method: "POST",
+    body: JSON.stringify({ strategy_id: strategyId }),
+  });
+}
+
+export function getMarketScoreJob(
+  jobId: string,
+): Promise<MarketScoreJobStatus> {
+  return request<MarketScoreJobStatus>(
+    `/score/market-job/${encodeURIComponent(jobId)}`,
+  );
 }
 
 export function scoreSingle(
