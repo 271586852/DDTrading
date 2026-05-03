@@ -104,18 +104,16 @@ NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8011
 
 ### 后端
 
-可选环境变量：
+在 `backend/.env` 中配置：
 
 ```env
-DDTRADING_DATA_PATH=./data/mock_data.parquet
-DDTRADING_CORS_ORIGINS=http://127.0.0.1:3000
+TUSHARE_TOKEN=your_tushare_token_here
+DDTRADING_CORS_ORIGINS=http://127.0.0.1:3010,http://localhost:3010
 ```
-
-示例文件见 `backend/.env.example`。
 
 说明：
 
-- `DDTRADING_DATA_PATH` 用于切换本地 Parquet 数据源
+- `TUSHARE_TOKEN` 为后端抓取真实行情所需令牌
 - `DDTRADING_CORS_ORIGINS` 支持逗号分隔多个前端来源
 
 ## 前后端联调约定
@@ -143,7 +141,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8011
 ```
 
 - 生产环境建议把 `DDTRADING_CORS_ORIGINS` 设置为真实前端域名
-- 如果使用真实数据文件，配置 `DDTRADING_DATA_PATH`
+- 行情与评分数据来自 Tushare 缓存 parquet：配置 `TUSHARE_TOKEN`，按需设置 `DDTRADING_TUSHARE_DAILY_PARQUET_PATH`、`DDTRADING_DAILY_HISTORY_DAYS` 等（见 `backend/.env.example`）
 
 ## 常见问题
 

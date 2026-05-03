@@ -20,28 +20,27 @@ Or from repo root:
 .\scripts\start-backend.ps1
 ```
 
-## Data Sources
+Default config is loaded from `backend/.env` when using the script.
 
-The backend supports 3 data source modes:
+## Data Source
 
-- `DDTRADING_DATA_SOURCE=auto`: try AKShare first, fallback to local parquet.
-- `DDTRADING_DATA_SOURCE=akshare`: use AKShare only (no fallback).
-- `DDTRADING_DATA_SOURCE=parquet`: use local parquet only.
+The backend now uses Tushare as the only online data source.
 
-### AKShare options
+### Required
 
 ```env
-DDTRADING_AKSHARE_UNIVERSE_SIZE=300
-DDTRADING_AKSHARE_HISTORY_DAYS=120
-DDTRADING_AKSHARE_MAX_WORKERS=8
-DDTRADING_AKSHARE_CACHE_TTL_SECONDS=600
+TUSHARE_TOKEN=your_tushare_token_here
 ```
 
-### Parquet option
+### Tushare options
 
 ```env
-DDTRADING_DATA_PATH=./data/mock_data.parquet
+DDTRADING_TUSHARE_UNIVERSE_SIZE=300
+DDTRADING_TUSHARE_MAX_WORKERS=8
+DDTRADING_TUSHARE_DAILY_PARQUET_PATH=./data/tushare_daily.parquet
 ```
+
+Create `backend/.env` directly and fill values from the sections above.
 
 ## Generate Mock Data
 

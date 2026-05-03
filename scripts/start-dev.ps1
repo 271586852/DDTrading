@@ -2,7 +2,7 @@ param(
     [int]$FrontendPort = 3010,
     [int]$BackendPort = 8010,
     [string]$HostAddress = "127.0.0.1",
-    [string]$DataSource = "auto"
+    [string]$TushareToken = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,13 +36,13 @@ function Stop-ProcessUsingPort {
             Select-Object -Unique
     }
 
-    foreach ($pid in $pids) {
-        if ($pid -gt 0 -and $pid -ne $PID) {
+    foreach ($processId in $pids) {
+        if ($processId -gt 0 -and $processId -ne $PID) {
             try {
-                Stop-Process -Id $pid -Force -ErrorAction Stop
-                Write-Host "Killed process $pid on port $Port"
+                Stop-Process -Id $processId -Force -ErrorAction Stop
+                Write-Host "Killed process $processId on port $Port"
             } catch {
-                Write-Warning "Failed to kill process $pid on port ${Port}: $($_.Exception.Message)"
+                Write-Warning "Failed to kill process $processId on port ${Port}: $($_.Exception.Message)"
             }
         }
     }
@@ -51,15 +51,18 @@ function Stop-ProcessUsingPort {
 Stop-ProcessUsingPort -Port $BackendPort
 Stop-ProcessUsingPort -Port $FrontendPort
 
-Start-Process powershell -ArgumentList @(
+$backendArgs = @(
     "-NoExit",
     "-ExecutionPolicy", "Bypass",
     "-File", "`"$backendScript`"",
     "-HostAddress", $HostAddress,
     "-Port", $BackendPort,
-    "-DataSource", $DataSource,
     "-CorsOrigins", $corsOrigins
 )
+if (-not [string]::IsNullOrWhiteSpace($TushareToken)) {
+    $backendArgs += @("-TushareToken", $TushareToken)
+}
+Start-Process powershell -ArgumentList $backendArgs
 
 Start-Sleep -Seconds 2
 

@@ -6,16 +6,8 @@ import logging
 
 import polars as pl
 
-from app.config import (
-    get_akshare_cache_ttl_seconds,
-    get_akshare_history_days,
-    get_akshare_max_workers,
-    get_akshare_universe_size,
-    get_data_path,
-    get_data_source,
-)
 from app.schemas import ScoreRequest
-from app.strategies import ScoringStrategy, get_strategy
+from app.strategies import ScoringStrategy, get_strategy, get_strategy_lookback_days
 
 
 FACTOR_COLUMNS = {
@@ -28,6 +20,11 @@ REQUIRED_COLUMNS = ["ticker", "name", "pe_ratio", "momentum_20d", "volatility"]
 
 LOGGER = logging.getLogger(__name__)
 SINGLE_STOCK_ONLY_STRATEGY_ID = "single_stock_only"
+
+
+def _required_fetch_days(lookback_days: int) -> int:
+    """把策略窗口(交易日)映射为按需补数的自然日范围。"""
+    return max(lookback_days * 3, 120)
 
 
 def _raw_weights(payload: ScoreRequest) -> tuple[Dict[str, float], ScoringStrategy | None]:
@@ -79,48 +76,11 @@ def _scale_scores_to_100(frame: pl.DataFrame, score_column: str) -> pl.DataFrame
 
 
 def load_dataset() -> pl.DataFrame:
-    data_source = get_data_source()
+    # 评分宽表统一来自 Tushare 驱动的 parquet 组装层。
+    from app.akshare_loader import load_tushare_dataset
 
-    if data_source == "parquet":
-        return _load_dataset_from_parquet()
-
-    if data_source == "akshare":
-        return _load_dataset_from_akshare()
-
-    # auto mode: prefer AKShare, fallback to local parquet when network/data source fails
-    try:
-        return _load_dataset_from_akshare()
-    except Exception as ak_exc:
-        LOGGER.warning(
-            "AKShare dataset load failed in auto mode (%s). Fallback to parquet.",
-            type(ak_exc).__name__,
-        )
-        return _load_dataset_from_parquet()
-
-
-def _load_dataset_from_parquet() -> pl.DataFrame:
-    data_path = get_data_path()
-    if not data_path.exists():
-        raise FileNotFoundError(
-            f"Mock dataset not found at '{data_path}'. Run the generator script first."
-        )
-    dataset = pl.read_parquet(data_path)
-    return _validate_dataset(dataset, source_name="parquet")
-
-
-def _load_dataset_from_akshare() -> pl.DataFrame:
-    from app.akshare_loader import load_akshare_dataset
-
-    # universe_size=0 → 不做字典序截断，全市场进评分。
-    # 历史上这里是用来限流网络请求的，现在数据源是 parquet，截断只会
-    # 让靠后字典序（如 6xx/688 科创板）永远进不了排行榜。
-    dataset = load_akshare_dataset(
-        universe_size=0,
-        history_days=get_akshare_history_days(),
-        max_workers=get_akshare_max_workers(),
-        cache_ttl_seconds=get_akshare_cache_ttl_seconds(),
-    )
-    return _validate_dataset(dataset, source_name="akshare")
+    dataset = load_tushare_dataset(universe_size=0)
+    return _validate_dataset(dataset, source_name="tushare")
 
 
 def _validate_dataset(dataset: pl.DataFrame, source_name: str) -> pl.DataFrame:
@@ -178,37 +138,54 @@ def _rank_dataset(dataset: pl.DataFrame, weights: Dict[str, float]) -> pl.DataFr
     return scored
 
 
-def _build_single_symbol_dataset(symbol: str) -> pl.DataFrame:
-    from app.market_data import ensure_symbol_cached, load_ashare_daily, load_pe_snapshot, load_stock_names
-
-    ensure_symbol_cached(symbol)
-
-    daily = load_ashare_daily()
-    one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
-    if one_daily.height < 21:
-        raise KeyError(f"Symbol '{symbol}' has insufficient daily bars for single-stock scoring.")
-
-    prepared = one_daily.with_columns(
-        pl.col("close").pct_change().alias("daily_return")
+def _build_single_symbol_dataset(symbol: str, *, lookback_days: int = 20) -> pl.DataFrame:
+    from app.akshare_loader import (
+        MOMENTUM_LOOKBACK,
+        VOLATILITY_LOOKBACK,
+        compute_latest_factors_from_daily,
     )
-    factor_row = prepared.select(
-        [
-            (pl.col("close").last() / pl.col("close").shift(20).last() - 1.0).alias("momentum_20d"),
-            pl.col("daily_return").tail(20).std(ddof=0).alias("volatility"),
-            pl.col("daily_return").drop_nulls().count().alias("valid_returns"),
-        ]
-    ).to_dicts()[0]
+    from app.market_data import (
+        ensure_symbol_cached,
+        load_tushare_daily,
+        load_pe_snapshot,
+        load_stock_names,
+        refresh_market_data,
+    )
 
-    momentum_20d = factor_row["momentum_20d"]
-    volatility = factor_row["volatility"]
-    valid_returns = int(factor_row["valid_returns"] or 0)
-    if momentum_20d is None or volatility is None or valid_returns < 20:
+    # 本地优先；若不足则按策略需求自动补齐（单股补数 -> 增量刷新兜底）。
+    fetch_days = _required_fetch_days(lookback_days)
+    ensure_symbol_cached(symbol, days=fetch_days)
+
+    daily = load_tushare_daily()
+    one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
+    min_rows = lookback_days + 1
+    if one_daily.height < min_rows:
+        refresh_market_data(mode="incremental")
+        daily = load_tushare_daily()
+        one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
+        if one_daily.height < min_rows:
+            raise KeyError(
+                f"Symbol '{symbol}' has insufficient daily bars for single-stock scoring "
+                f"(need >= {min_rows}, got {one_daily.height})."
+            )
+
+    factors = compute_latest_factors_from_daily(
+        one_daily,
+        momentum_lookback=MOMENTUM_LOOKBACK,
+        volatility_lookback=VOLATILITY_LOOKBACK,
+    )
+    if factors is None:
         raise KeyError(f"Symbol '{symbol}' has incomplete factor data for single-stock scoring.")
+    momentum_20d, volatility = factors
 
     pe_snapshot = load_pe_snapshot()
     pe_match = pe_snapshot.filter(pl.col("symbol") == symbol)
     if pe_match.height == 0:
-        raise KeyError(f"Symbol '{symbol}' has no PE data for single-stock scoring.")
+        # 单股补数后仍缺 PE，尝试刷新 PE 快照一次。
+        pe_snapshot = load_pe_snapshot(refresh=True)
+        pe_match = pe_snapshot.filter(pl.col("symbol") == symbol)
+        if pe_match.height == 0:
+            raise KeyError(f"Symbol '{symbol}' has no PE data for single-stock scoring.")
     pe_ratio = pe_match.select(pl.col("pe_ratio").last()).item()
     if pe_ratio is None:
         raise KeyError(f"Symbol '{symbol}' has null PE data for single-stock scoring.")
@@ -235,8 +212,10 @@ def _build_single_symbol_dataset(symbol: str) -> pl.DataFrame:
 def _score_single_stock_only(
     symbol: str,
     weights: Dict[str, float],
+    *,
+    lookback_days: int,
 ) -> dict[str, object]:
-    dataset = _build_single_symbol_dataset(symbol)
+    dataset = _build_single_symbol_dataset(symbol, lookback_days=lookback_days)
     row = dataset.to_dicts()[0]
 
     # 单股模式下没有横截面对比，采用稳定单调映射得到可解释的 0~100 分。
@@ -287,6 +266,13 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
     }
 
     target_symbol = (payload.symbol or "").strip()
+    lookback_days = get_strategy_lookback_days(payload.strategy_id)
+
+    # 全市场分析：默认先增量更新再分析。
+    if not target_symbol:
+        from app.market_data import refresh_market_data
+        refresh_market_data(mode="incremental")
+
     if (
         applied_strategy is not None
         and applied_strategy.id == SINGLE_STOCK_ONLY_STRATEGY_ID
@@ -300,7 +286,11 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
                 f"Symbol '{normalized}' is an ETF, which is not supported by "
                 "the current scoring pipeline (no PE ratio)."
             )
-        result = _score_single_stock_only(normalized, weights)
+        result = _score_single_stock_only(
+            normalized,
+            weights,
+            lookback_days=lookback_days,
+        )
         result["applied_strategy"] = {
             "id": applied_strategy.id,
             "name": applied_strategy.name,
@@ -312,8 +302,31 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
         }
         return result
 
-    dataset = load_dataset()
-    scored = _rank_dataset(dataset, weights)
+    dataset: pl.DataFrame | None = None
+    scored: pl.DataFrame | None = None
+    try:
+        dataset = load_dataset()
+        scored = _rank_dataset(dataset, weights)
+    except Exception:
+        if target_symbol:
+            normalized = _normalize_ticker_input(target_symbol)
+            result = _score_single_stock_only(
+                normalized,
+                weights,
+                lookback_days=lookback_days,
+            )
+            if applied_strategy is not None:
+                result["applied_strategy"] = {
+                    "id": applied_strategy.id,
+                    "name": applied_strategy.name,
+                    "description": applied_strategy.description,
+                    "weights": {
+                        key: round(value, 4)
+                        for key, value in applied_strategy.weights().items()
+                    },
+                }
+            return result
+        raise
 
     mode = "market"
     on_demand_ensured: dict | None = None
@@ -329,6 +342,7 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
                 "the current scoring pipeline (no PE ratio)."
             )
 
+        assert scored is not None
         matched = scored.filter(pl.col("ticker") == normalized)
         if matched.height == 0:
             LOGGER.info(
@@ -336,7 +350,10 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
                 normalized,
             )
             try:
-                on_demand_ensured = ensure_symbol_cached(normalized)
+                on_demand_ensured = ensure_symbol_cached(
+                    normalized,
+                    days=_required_fetch_days(lookback_days),
+                )
             except ValueError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -362,10 +379,12 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
 
         top_rows = matched.head(1)
     else:
+        assert scored is not None
         top_rows = scored.head(top_n)
 
     rows_out = [_row_to_ranked(row) for row in top_rows.iter_rows(named=True)]
 
+    assert dataset is not None
     result: Dict[str, object] = {
         "normalized_weights": {
             key: round(value, 4) for key, value in weights.items()

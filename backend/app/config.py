@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATA_PATH = BACKEND_ROOT / "data" / "mock_data.parquet"
-DEFAULT_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "ashare_daily.parquet"
-DEFAULT_BAOSTOCK_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "baostock_daily.parquet"
+DEFAULT_TUSHARE_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "tushare_daily.parquet"
 DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
     "http://127.0.0.1:3000",
     "http://localhost:3000",
@@ -16,29 +13,17 @@ DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
     "http://localhost:3001",
 )
 DEFAULT_FRONTEND_ORIGIN = DEFAULT_FRONTEND_ORIGINS[0]
-DEFAULT_DATA_SOURCE: Literal["auto", "parquet", "akshare"] = "auto"
-DEFAULT_AKSHARE_UNIVERSE_SIZE = 300
-DEFAULT_AKSHARE_HISTORY_DAYS = 120
-DEFAULT_AKSHARE_MAX_WORKERS = 8
-DEFAULT_AKSHARE_CACHE_TTL_SECONDS = 600
+DEFAULT_TUSHARE_UNIVERSE_SIZE = 300
+DEFAULT_TUSHARE_MAX_WORKERS = 8
 DEFAULT_DAILY_HISTORY_DAYS = 3650
 DEFAULT_DAILY_CACHE_TTL_HOURS = 24
 
 
-def get_data_path() -> Path:
-    raw_path = os.getenv("DDTRADING_DATA_PATH")
-    if not raw_path:
-        return DEFAULT_DATA_PATH
-    return Path(raw_path).expanduser().resolve()
-
-
-def get_data_source() -> Literal["auto", "parquet", "akshare"]:
-    raw_source = os.getenv("DDTRADING_DATA_SOURCE", DEFAULT_DATA_SOURCE).strip().lower()
-    if raw_source in {"auto", "parquet", "akshare"}:
-        return raw_source
-    raise ValueError(
-        "DDTRADING_DATA_SOURCE must be one of: auto, parquet, akshare."
-    )
+def get_tushare_token() -> str:
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if not token:
+        raise ValueError("TUSHARE_TOKEN is required for Tushare data source.")
+    return token
 
 
 def _get_int_env(name: str, default: int, minimum: int = 1) -> int:
@@ -54,51 +39,27 @@ def _get_int_env(name: str, default: int, minimum: int = 1) -> int:
     return parsed
 
 
-def get_akshare_universe_size() -> int:
+def get_tushare_universe_size() -> int:
     return _get_int_env(
-        "DDTRADING_AKSHARE_UNIVERSE_SIZE",
-        default=DEFAULT_AKSHARE_UNIVERSE_SIZE,
+        "DDTRADING_TUSHARE_UNIVERSE_SIZE",
+        default=DEFAULT_TUSHARE_UNIVERSE_SIZE,
         minimum=20,
     )
 
 
-def get_akshare_history_days() -> int:
+def get_tushare_max_workers() -> int:
     return _get_int_env(
-        "DDTRADING_AKSHARE_HISTORY_DAYS",
-        default=DEFAULT_AKSHARE_HISTORY_DAYS,
-        minimum=30,
-    )
-
-
-def get_akshare_max_workers() -> int:
-    return _get_int_env(
-        "DDTRADING_AKSHARE_MAX_WORKERS",
-        default=DEFAULT_AKSHARE_MAX_WORKERS,
+        "DDTRADING_TUSHARE_MAX_WORKERS",
+        default=DEFAULT_TUSHARE_MAX_WORKERS,
         minimum=1,
     )
 
 
-def get_akshare_cache_ttl_seconds() -> int:
-    return _get_int_env(
-        "DDTRADING_AKSHARE_CACHE_TTL_SECONDS",
-        default=DEFAULT_AKSHARE_CACHE_TTL_SECONDS,
-        minimum=0,
-    )
-
-
-def get_daily_parquet_path() -> Path:
-    """本地全市场日线 parquet 的存储路径。"""
-    raw_path = os.getenv("DDTRADING_DAILY_PARQUET_PATH")
+def get_tushare_daily_parquet_path() -> Path:
+    """Tushare 日线 parquet 的存储路径。"""
+    raw_path = os.getenv("DDTRADING_TUSHARE_DAILY_PARQUET_PATH")
     if not raw_path:
-        return DEFAULT_DAILY_PARQUET_PATH
-    return Path(raw_path).expanduser().resolve()
-
-
-def get_baostock_daily_parquet_path() -> Path:
-    """BaoStock 日线 parquet 的存储路径。"""
-    raw_path = os.getenv("DDTRADING_BAOSTOCK_DAILY_PARQUET_PATH")
-    if not raw_path:
-        return DEFAULT_BAOSTOCK_DAILY_PARQUET_PATH
+        return DEFAULT_TUSHARE_DAILY_PARQUET_PATH
     return Path(raw_path).expanduser().resolve()
 
 

@@ -13,7 +13,7 @@ from typing import Any
 
 import polars as pl
 
-from app.config import get_baostock_daily_parquet_path
+from app.config import get_tushare_daily_parquet_path
 from app.market_data import (
     _is_etf_symbol,
     _is_stock_symbol,
@@ -26,7 +26,7 @@ DEFAULT_HISTORY_BARS = 120
 
 
 def _resolve_name(symbol: str) -> str | None:
-    path = get_baostock_daily_parquet_path().parent / "stock_names.parquet"
+    path = get_tushare_daily_parquet_path().parent / "stock_names.parquet"
     if not path.exists():
         return None
     try:
@@ -85,7 +85,7 @@ def fetch_quote(symbol: str, *, bars: int = DEFAULT_HISTORY_BARS) -> dict[str, A
     """
     normalized = _normalize_symbol(symbol)
 
-    path = get_baostock_daily_parquet_path()
+    path = get_tushare_daily_parquet_path()
     if path.exists():
         daily = pl.read_parquet(path)
     else:
