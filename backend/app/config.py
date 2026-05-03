@@ -15,6 +15,8 @@ DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
 DEFAULT_FRONTEND_ORIGIN = DEFAULT_FRONTEND_ORIGINS[0]
 DEFAULT_TUSHARE_UNIVERSE_SIZE = 300
 DEFAULT_TUSHARE_MAX_WORKERS = 8
+# Tushare 日线等接口常见限额：500 次/分钟；并发拉取时在此上限内排队。
+DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE = 500
 DEFAULT_DAILY_HISTORY_DAYS = 3650
 DEFAULT_DAILY_CACHE_TTL_HOURS = 24
 
@@ -53,6 +55,16 @@ def get_tushare_max_workers() -> int:
         default=DEFAULT_TUSHARE_MAX_WORKERS,
         minimum=1,
     )
+
+
+def get_tushare_max_requests_per_minute() -> int:
+    """Tushare API 每分钟最大请求数（滑动窗口），不超过平台常见 500 上限。"""
+    parsed = _get_int_env(
+        "DDTRADING_TUSHARE_MAX_REQUESTS_PER_MINUTE",
+        default=DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE,
+        minimum=1,
+    )
+    return min(parsed, DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE)
 
 
 def get_tushare_daily_parquet_path() -> Path:

@@ -1,5 +1,9 @@
 """Tushare 数据层（替代 AKShare / BaoStock）。
 
+全模块对 ``pro.daily`` / ``stock_basic`` / ``daily_basic`` 等请求统一做
+**每分钟请求数滑动窗口限流**（默认 500 次/分钟，见 ``get_tushare_max_requests_per_minute``），
+多线程拉取时会在限额内自动排队，避免触发 Tushare 频控。
+
 输出三张 parquet：
 - 日线: ``date / open / high / low / close / volume / symbol``
 - 名称: ``symbol / name``
@@ -11,10 +15,11 @@ import logging
 import os
 import tempfile
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Iterable
 
 import pandas as pd
@@ -23,6 +28,7 @@ import polars as pl
 from app.config import (
     get_daily_cache_ttl_hours,
     get_daily_history_days,
+    get_tushare_max_requests_per_minute,
     get_tushare_max_workers,
     get_tushare_token,
     get_tushare_daily_parquet_path,
@@ -66,6 +72,28 @@ def _get_pro():
         raise ModuleNotFoundError("tushare is not installed")
     ts.set_token(get_tushare_token())
     return ts.pro_api()
+
+
+_TUSHARE_RL_LOCK = Lock()
+_TUSHARE_RL_TIMES: deque[float] = deque()
+_TUSHARE_RL_WINDOW_SEC = 60.0
+
+
+def _acquire_tushare_request_slot() -> None:
+    """在并发拉取时限制 Tushare 请求频率（默认 500 次/分钟，滑动窗口）。"""
+    limit = get_tushare_max_requests_per_minute()
+    window = _TUSHARE_RL_WINDOW_SEC
+    while True:
+        sleep_for = 0.0
+        with _TUSHARE_RL_LOCK:
+            now = time.monotonic()
+            while _TUSHARE_RL_TIMES and _TUSHARE_RL_TIMES[0] <= now - window:
+                _TUSHARE_RL_TIMES.popleft()
+            if len(_TUSHARE_RL_TIMES) < limit:
+                _TUSHARE_RL_TIMES.append(now)
+                return
+            sleep_for = _TUSHARE_RL_TIMES[0] + window - now + 0.005
+        time.sleep(max(sleep_for, 0.01))
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +167,7 @@ def _normalize(
 
 
 def _fetch_tushare_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    _acquire_tushare_request_slot()
     pro = _get_pro()
     raw = pro.daily(
         ts_code=_to_ts_code(symbol),
@@ -180,6 +209,7 @@ def fetch_daily_one(
 
 def list_universe() -> list[str]:
     """获取股票池代码列表：当前为 A 股股票（不含北交所）。"""
+    _acquire_tushare_request_slot()
     pro = _get_pro()
     raw = pro.stock_basic(
         exchange="",
@@ -335,6 +365,7 @@ def _to_float(value) -> float | None:
 
 
 def _fetch_stock_names() -> pd.DataFrame:
+    _acquire_tushare_request_slot()
     pro = _get_pro()
     raw = pro.stock_basic(
         exchange="",
@@ -372,6 +403,7 @@ def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
 
 def _fetch_pe_one(symbol: str) -> float | None:
     """逐只拉取最新 PE，优先 PE_TTM。"""
+    _acquire_tushare_request_slot()
     pro = _get_pro()
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
