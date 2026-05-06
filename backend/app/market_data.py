@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import tempfile
@@ -28,6 +29,7 @@ import polars as pl
 from app.config import (
     get_daily_cache_ttl_hours,
     get_daily_history_days,
+    get_market_refresh_cooldown_hours,
     get_tushare_max_requests_per_minute,
     get_tushare_max_workers,
     get_tushare_token,
@@ -234,6 +236,49 @@ def list_universe() -> list[str]:
 
 
 _CACHE_LOCK = RLock()
+
+_MARKET_REFRESH_MARKER = "market_refresh.json"
+
+
+def _market_refresh_marker_path() -> Path:
+    """与日线 parquet 同目录，记录最近一次全市场刷新成功的时间戳。"""
+    return get_tushare_daily_parquet_path().parent / _MARKET_REFRESH_MARKER
+
+
+def _read_market_refresh_unix() -> float | None:
+    path = _market_refresh_marker_path()
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = data.get("unix_ts")
+        if raw is None:
+            return None
+        return float(raw)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _write_market_refresh_unix() -> None:
+    path = _market_refresh_marker_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"unix_ts": time.time()}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def _within_market_refresh_cooldown() -> tuple[bool, float | None, int]:
+    """若仍在冷却窗口内则 (True, last_unix, hours)；否则 (False, last_unix, hours)。"""
+    hours = get_market_refresh_cooldown_hours()
+    if hours <= 0:
+        return False, _read_market_refresh_unix(), hours
+    last = _read_market_refresh_unix()
+    if last is None:
+        return False, None, hours
+    if time.time() - last < hours * 3600:
+        return True, last, hours
+    return False, last, hours
 
 
 def _parquet_is_fresh(path: Path, ttl_hours: int) -> bool:
@@ -713,19 +758,39 @@ def _refresh_market_data_incremental() -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-def refresh_market_data(*, mode: str = "full") -> dict[str, object]:
+def refresh_market_data(*, mode: str = "full", force: bool = False) -> dict[str, object]:
     """刷新市场缓存。
 
     ``mode='full'``: 全量重建 daily / names / pe 三张 parquet。
     ``mode='incremental'``: 日线按 symbol 最后日期补拉，名称做 upsert，PE 按日增量。
+
+    ``force=True`` 时跳过「距上次成功刷新不足冷却窗口」的短路（供单股/回测补数等内部调用）。
+    手动 ``POST /refresh`` 默认受 ``DDTRADING_MARKET_REFRESH_COOLDOWN_HOURS`` 约束（默认 24h）。
     """
+    if not force:
+        cooling, last_unix, cd_hours = _within_market_refresh_cooldown()
+        if cooling:
+            return {
+                "skipped": True,
+                "reason": "cooldown",
+                "cooldown_hours": cd_hours,
+                "last_refresh_unix": last_unix,
+                "message": (
+                    f"距上次全市场刷新不足 {cd_hours} 小时，已跳过。"
+                    " 需要立即更新请使用 POST /refresh?force=true 。"
+                ),
+            }
+
     if mode == "incremental":
-        return _refresh_market_data_incremental()
+        summary = _refresh_market_data_incremental()
+        _write_market_refresh_unix()
+        return summary
     if mode != "full":
         raise ValueError("refresh mode must be either 'full' or 'incremental'")
 
     daily = load_tushare_daily(refresh=True)
     names = load_stock_names(refresh=True)
+    _write_market_refresh_unix()
 
     return {
         "mode": "full",

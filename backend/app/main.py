@@ -197,14 +197,21 @@ def export_backtest_report_endpoint(payload: BacktestReportRequest) -> Response:
 
 
 @app.post("/refresh")
-def refresh_data(mode: Literal["full", "incremental"] = "incremental") -> dict[str, object]:
+def refresh_data(
+    mode: Literal["full", "incremental"] = "incremental",
+    force: bool = False,
+) -> dict[str, object]:
     """手动刷新全市场日线 + 名称 + PE 快照。
 
     - ``mode=incremental``: 默认增量刷新，日线按已缓存最后日期补拉，PE 按日补齐。
     - ``mode=full``: 全量重建三张 parquet；首次或全量重建可能耗时 30~60 分钟。
+    - ``force=true``: 跳过「距上次成功刷新不足冷却窗口」的短路（默认冷却见环境变量）。
     """
     try:
-        return {"status": "ok", "mode": mode, "summary": refresh_market_data(mode=mode)}
+        summary = refresh_market_data(mode=mode, force=force)
+        if summary.get("skipped"):
+            return {"status": "skipped", "mode": mode, "summary": summary}
+        return {"status": "ok", "mode": mode, "summary": summary}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive API boundary

@@ -17,6 +17,7 @@ backend/data/ashare_daily.parquet
 backend/data/stock_names.parquet
 backend/data/pe_snapshot.parquet
 backend/data/*.parquet.tmp
+backend/data/market_refresh.json
 # 保留只读 mock（手工生成的基准数据，体积小）
 !backend/data/mock_data.parquet
 
