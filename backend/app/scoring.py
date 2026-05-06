@@ -168,7 +168,7 @@ def _build_single_symbol_dataset(symbol: str, *, lookback_days: int = 20) -> pl.
     one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
     min_rows = lookback_days + 1
     if one_daily.height < min_rows:
-        refresh_market_data(mode="incremental")
+        refresh_market_data(mode="incremental", force=True)
         daily = load_tushare_daily()
         one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
         if one_daily.height < min_rows:
@@ -283,13 +283,9 @@ def score_stocks(
 
     _report_progress(progress, 1, "准备评分…")
 
-    # 全市场分析：默认先增量更新再分析。
+    # 全市场分析：只读本地 parquet；行情更新请单独 POST /refresh。
     if not target_symbol:
-        from app.market_data import refresh_market_data
-
-        _report_progress(progress, 5, "增量刷新市场缓存…")
-        refresh_market_data(mode="incremental")
-        _report_progress(progress, 28, "市场缓存已更新")
+        _report_progress(progress, 8, "使用本地缓存评分（未自动刷新行情）…")
 
     if (
         applied_strategy is not None

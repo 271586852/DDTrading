@@ -281,13 +281,13 @@ def _ensure_backtest_window_cached(symbol: str, start_req: date, end_req: date) 
     daily = load_tushare_daily()
     sub = daily.filter(pl.col("symbol") == symbol).sort("date")
     if sub.height == 0:
-        refresh_market_data(mode="incremental")
+        refresh_market_data(mode="incremental", force=True)
         return
 
     data_min = _to_date(sub.select(pl.col("date").min()).item())
     data_max = _to_date(sub.select(pl.col("date").max()).item())
     if data_min > start_req or data_max < end_req:
-        refresh_market_data(mode="incremental")
+        refresh_market_data(mode="incremental", force=True)
 
 
 def run_single_symbol_backtest(
