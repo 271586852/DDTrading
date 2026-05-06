@@ -101,9 +101,13 @@ export function fetchQuote(symbol: string, bars = 120): Promise<QuoteResponse> {
 
 export function refreshMarketData(
   mode: RefreshMode = "incremental",
+  options?: { force?: boolean },
 ): Promise<RefreshResponse> {
-  const qs = new URLSearchParams({ mode }).toString();
-  return request<RefreshResponse>(`/refresh?${qs}`, {
+  const qs = new URLSearchParams({ mode });
+  if (options?.force) {
+    qs.set("force", "true");
+  }
+  return request<RefreshResponse>(`/refresh?${qs.toString()}`, {
     method: "POST",
   });
 }
