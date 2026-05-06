@@ -27,11 +27,11 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
 
   if (!open) return null;
 
-  const handleRefresh = async () => {
+  const handleRefresh = async (force: boolean) => {
     setRefreshing(true);
     setError(null);
     try {
-      const response = await refreshMarketData("incremental");
+      const response = await refreshMarketData("incremental", { force });
       setResult(response);
     } catch (err) {
       setError(err instanceof Error ? err.message : "更新数据失败");
@@ -57,8 +57,8 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               数据更新
             </h2>
             <p className="mt-2 text-sm leading-6 text-slate-400">
-              点击“更新数据”会触发一次全市场增量刷新：日线按已缓存最后日期补拉，
-              名称做 upsert，PE 快照按天补齐到最新。
+              全市场评分默认只读本地缓存；在此手动触发增量刷新（日线补拉、名称 upsert、PE
+              按日补齐）。同一机器上距上次成功刷新不足 24 小时会跳过，可用「强制刷新」绕过。
             </p>
           </div>
           <button
@@ -79,19 +79,29 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 默认走增量刷新，通常比全量重建快很多。
               </p>
             </div>
-            <button
-              type="button"
-              onClick={() => void handleRefresh()}
-              disabled={refreshing}
-              className="inline-flex items-center justify-center gap-2 rounded-full border border-cyan-400/30 bg-cyan-500/10 px-4 py-2 text-sm font-medium text-cyan-100 transition hover:border-cyan-300/50 hover:bg-cyan-400/15 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {refreshing ? (
-                <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.8} />
-              ) : (
-                <RefreshCw className="h-4 w-4" strokeWidth={1.8} />
-              )}
-              {refreshing ? "更新中..." : "更新数据"}
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleRefresh(false)}
+                disabled={refreshing}
+                className="inline-flex items-center justify-center gap-2 rounded-full border border-cyan-400/30 bg-cyan-500/10 px-4 py-2 text-sm font-medium text-cyan-100 transition hover:border-cyan-300/50 hover:bg-cyan-400/15 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {refreshing ? (
+                  <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.8} />
+                ) : (
+                  <RefreshCw className="h-4 w-4" strokeWidth={1.8} />
+                )}
+                {refreshing ? "更新中..." : "更新数据"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleRefresh(true)}
+                disabled={refreshing}
+                className="rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-100 transition hover:border-amber-300/50 hover:bg-amber-400/15 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                强制刷新
+              </button>
+            </div>
           </div>
         </div>
 
@@ -101,7 +111,17 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
           </div>
         )}
 
-        {result && (
+        {result && result.status === "skipped" && "skipped" in result.summary && (
+          <div className="mt-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            <p className="font-medium">本次未执行刷新（冷却中）</p>
+            <p className="mt-2 text-xs leading-5 text-amber-100/90">
+              {result.summary.message ??
+                `距上次成功刷新不足 ${result.summary.cooldown_hours} 小时。需要立即更新请点击「强制刷新」。`}
+            </p>
+          </div>
+        )}
+
+        {result && result.status === "ok" && "daily" in result.summary && (
           <div className="mt-4 space-y-3">
             <div className="rounded-xl border border-emerald-400/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
               数据更新完成，当前模式：

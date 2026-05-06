@@ -10,6 +10,8 @@ export function MarketAnalysisDialog() {
   const ranking = useScoringStore((state) => state.marketRanking);
   const loading = useScoringStore((state) => state.marketLoading);
   const error = useScoringStore((state) => state.marketError);
+  const progress = useScoringStore((state) => state.marketProgress);
+  const stage = useScoringStore((state) => state.marketStage);
   const close = useScoringStore((state) => state.closeMarketRanking);
   const selectedStrategyId = useScoringStore((state) => state.selectedStrategyId);
   const strategies = useScoringStore((state) => state.strategies);
@@ -68,9 +70,25 @@ export function MarketAnalysisDialog() {
 
         <div className="flex-1 overflow-y-auto">
           {loading && (
-            <div className="flex items-center justify-center gap-2 px-6 py-16 text-sm text-slate-400">
-              <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.8} />
-              后端正在基于本地 parquet 计算全市场评分…
+            <div className="flex flex-col items-stretch gap-4 px-6 py-12 text-sm text-slate-400">
+              <div className="flex items-center justify-center gap-2">
+                <Loader2 className="h-4 w-4 shrink-0 animate-spin" strokeWidth={1.8} />
+                <span>
+                  {stage ?? "后端正在基于本地 parquet 计算全市场评分…"}
+                </span>
+              </div>
+              <div className="mx-auto w-full max-w-md space-y-1.5">
+                <div className="flex justify-between text-xs text-slate-500">
+                  <span>进度</span>
+                  <span className="tabular-nums">{progress}%</span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-purple-500 to-cyan-500 transition-[width] duration-300 ease-out"
+                    style={{ width: `${Math.min(100, Math.max(0, progress))}%` }}
+                  />
+                </div>
+              </div>
             </div>
           )}
           {error && (

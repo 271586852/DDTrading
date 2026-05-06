@@ -39,6 +39,18 @@ export type ScoreResponse = {
   applied_strategy?: StrategyInfo | null;
 };
 
+export type MarketScoreJobStarted = {
+  job_id: string;
+};
+
+export type MarketScoreJobStatus = {
+  status: "pending" | "running" | "completed" | "failed";
+  progress: number;
+  stage: string;
+  result?: ScoreResponse | null;
+  error?: string | null;
+};
+
 export type QuoteCandle = {
   date: string | null;
   open: number | null;
@@ -95,8 +107,17 @@ export type RefreshSummary = {
   pe: RefreshSectionSummary;
 };
 
+/** POST /refresh 在冷却窗口内跳过执行时返回的 summary */
+export type RefreshSkippedSummary = {
+  skipped: true;
+  reason: string;
+  cooldown_hours: number;
+  last_refresh_unix?: number | null;
+  message?: string;
+};
+
 export type RefreshResponse = {
-  status: string;
+  status: "ok" | "skipped";
   mode: RefreshMode;
-  summary: RefreshSummary;
+  summary: RefreshSummary | RefreshSkippedSummary;
 };

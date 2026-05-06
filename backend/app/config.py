@@ -15,8 +15,12 @@ DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
 DEFAULT_FRONTEND_ORIGIN = DEFAULT_FRONTEND_ORIGINS[0]
 DEFAULT_TUSHARE_UNIVERSE_SIZE = 300
 DEFAULT_TUSHARE_MAX_WORKERS = 8
+# Tushare 日线等接口常见限额：500 次/分钟；并发拉取时在此上限内排队。
+DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE = 500
 DEFAULT_DAILY_HISTORY_DAYS = 3650
 DEFAULT_DAILY_CACHE_TTL_HOURS = 24
+# POST /refresh 成功完成后，在多少小时内直接跳过重复刷新（0 表示不启用）。
+DEFAULT_MARKET_REFRESH_COOLDOWN_HOURS = 24
 
 
 def get_tushare_token() -> str:
@@ -55,6 +59,16 @@ def get_tushare_max_workers() -> int:
     )
 
 
+def get_tushare_max_requests_per_minute() -> int:
+    """Tushare API 每分钟最大请求数（滑动窗口），不超过平台常见 500 上限。"""
+    parsed = _get_int_env(
+        "DDTRADING_TUSHARE_MAX_REQUESTS_PER_MINUTE",
+        default=DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE,
+        minimum=1,
+    )
+    return min(parsed, DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE)
+
+
 def get_tushare_daily_parquet_path() -> Path:
     """Tushare 日线 parquet 的存储路径。"""
     raw_path = os.getenv("DDTRADING_TUSHARE_DAILY_PARQUET_PATH")
@@ -77,6 +91,15 @@ def get_daily_cache_ttl_hours() -> int:
     return _get_int_env(
         "DDTRADING_DAILY_CACHE_TTL_HOURS",
         default=DEFAULT_DAILY_CACHE_TTL_HOURS,
+        minimum=0,
+    )
+
+
+def get_market_refresh_cooldown_hours() -> int:
+    """全市场 POST /refresh 成功后的冷却时间（小时）。为 0 表示每次都会执行刷新逻辑。"""
+    return _get_int_env(
+        "DDTRADING_MARKET_REFRESH_COOLDOWN_HOURS",
+        default=DEFAULT_MARKET_REFRESH_COOLDOWN_HOURS,
         minimum=0,
     )
 

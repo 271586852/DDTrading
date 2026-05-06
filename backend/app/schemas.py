@@ -84,6 +84,23 @@ class ScoreResponse(BaseModel):
     )
 
 
+class MarketScoreJobStarted(BaseModel):
+    job_id: str = Field(description="用于轮询 GET /score/market-job/{job_id} 的任务 id。")
+
+
+class MarketScoreJobStatus(BaseModel):
+    status: Literal["pending", "running", "completed", "failed"] = Field(
+        description="pending=已创建；running=执行中；completed=成功；failed=异常结束。"
+    )
+    progress: int = Field(ge=0, le=100, description="粗略进度百分比。")
+    stage: str = Field(default="", description="当前阶段说明。")
+    result: Optional[ScoreResponse] = Field(
+        default=None,
+        description="仅当 status=completed 时返回评分结果。",
+    )
+    error: Optional[str] = Field(default=None, description="仅当 status=failed 时返回错误信息。")
+
+
 # ---------------------------------------------------------------------------
 # Backtesting
 # ---------------------------------------------------------------------------

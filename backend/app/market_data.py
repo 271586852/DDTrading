@@ -1,5 +1,9 @@
 """Tushare 数据层（替代 AKShare / BaoStock）。
 
+全模块对 ``pro.daily`` / ``stock_basic`` / ``daily_basic`` 等请求统一做
+**每分钟请求数滑动窗口限流**（默认 500 次/分钟，见 ``get_tushare_max_requests_per_minute``），
+多线程拉取时会在限额内自动排队，避免触发 Tushare 频控。
+
 输出三张 parquet：
 - 日线: ``date / open / high / low / close / volume / symbol``
 - 名称: ``symbol / name``
@@ -7,14 +11,16 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import tempfile
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Iterable
 
 import pandas as pd
@@ -23,6 +29,8 @@ import polars as pl
 from app.config import (
     get_daily_cache_ttl_hours,
     get_daily_history_days,
+    get_market_refresh_cooldown_hours,
+    get_tushare_max_requests_per_minute,
     get_tushare_max_workers,
     get_tushare_token,
     get_tushare_daily_parquet_path,
@@ -66,6 +74,28 @@ def _get_pro():
         raise ModuleNotFoundError("tushare is not installed")
     ts.set_token(get_tushare_token())
     return ts.pro_api()
+
+
+_TUSHARE_RL_LOCK = Lock()
+_TUSHARE_RL_TIMES: deque[float] = deque()
+_TUSHARE_RL_WINDOW_SEC = 60.0
+
+
+def _acquire_tushare_request_slot() -> None:
+    """在并发拉取时限制 Tushare 请求频率（默认 500 次/分钟，滑动窗口）。"""
+    limit = get_tushare_max_requests_per_minute()
+    window = _TUSHARE_RL_WINDOW_SEC
+    while True:
+        sleep_for = 0.0
+        with _TUSHARE_RL_LOCK:
+            now = time.monotonic()
+            while _TUSHARE_RL_TIMES and _TUSHARE_RL_TIMES[0] <= now - window:
+                _TUSHARE_RL_TIMES.popleft()
+            if len(_TUSHARE_RL_TIMES) < limit:
+                _TUSHARE_RL_TIMES.append(now)
+                return
+            sleep_for = _TUSHARE_RL_TIMES[0] + window - now + 0.005
+        time.sleep(max(sleep_for, 0.01))
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +169,7 @@ def _normalize(
 
 
 def _fetch_tushare_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    _acquire_tushare_request_slot()
     pro = _get_pro()
     raw = pro.daily(
         ts_code=_to_ts_code(symbol),
@@ -180,6 +211,7 @@ def fetch_daily_one(
 
 def list_universe() -> list[str]:
     """获取股票池代码列表：当前为 A 股股票（不含北交所）。"""
+    _acquire_tushare_request_slot()
     pro = _get_pro()
     raw = pro.stock_basic(
         exchange="",
@@ -204,6 +236,49 @@ def list_universe() -> list[str]:
 
 
 _CACHE_LOCK = RLock()
+
+_MARKET_REFRESH_MARKER = "market_refresh.json"
+
+
+def _market_refresh_marker_path() -> Path:
+    """与日线 parquet 同目录，记录最近一次全市场刷新成功的时间戳。"""
+    return get_tushare_daily_parquet_path().parent / _MARKET_REFRESH_MARKER
+
+
+def _read_market_refresh_unix() -> float | None:
+    path = _market_refresh_marker_path()
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = data.get("unix_ts")
+        if raw is None:
+            return None
+        return float(raw)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _write_market_refresh_unix() -> None:
+    path = _market_refresh_marker_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"unix_ts": time.time()}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def _within_market_refresh_cooldown() -> tuple[bool, float | None, int]:
+    """若仍在冷却窗口内则 (True, last_unix, hours)；否则 (False, last_unix, hours)。"""
+    hours = get_market_refresh_cooldown_hours()
+    if hours <= 0:
+        return False, _read_market_refresh_unix(), hours
+    last = _read_market_refresh_unix()
+    if last is None:
+        return False, None, hours
+    if time.time() - last < hours * 3600:
+        return True, last, hours
+    return False, last, hours
 
 
 def _parquet_is_fresh(path: Path, ttl_hours: int) -> bool:
@@ -335,6 +410,7 @@ def _to_float(value) -> float | None:
 
 
 def _fetch_stock_names() -> pd.DataFrame:
+    _acquire_tushare_request_slot()
     pro = _get_pro()
     raw = pro.stock_basic(
         exchange="",
@@ -372,6 +448,7 @@ def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
 
 def _fetch_pe_one(symbol: str) -> float | None:
     """逐只拉取最新 PE，优先 PE_TTM。"""
+    _acquire_tushare_request_slot()
     pro = _get_pro()
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
@@ -681,19 +758,39 @@ def _refresh_market_data_incremental() -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-def refresh_market_data(*, mode: str = "full") -> dict[str, object]:
+def refresh_market_data(*, mode: str = "full", force: bool = False) -> dict[str, object]:
     """刷新市场缓存。
 
     ``mode='full'``: 全量重建 daily / names / pe 三张 parquet。
     ``mode='incremental'``: 日线按 symbol 最后日期补拉，名称做 upsert，PE 按日增量。
+
+    ``force=True`` 时跳过「距上次成功刷新不足冷却窗口」的短路（供单股/回测补数等内部调用）。
+    手动 ``POST /refresh`` 默认受 ``DDTRADING_MARKET_REFRESH_COOLDOWN_HOURS`` 约束（默认 24h）。
     """
+    if not force:
+        cooling, last_unix, cd_hours = _within_market_refresh_cooldown()
+        if cooling:
+            return {
+                "skipped": True,
+                "reason": "cooldown",
+                "cooldown_hours": cd_hours,
+                "last_refresh_unix": last_unix,
+                "message": (
+                    f"距上次全市场刷新不足 {cd_hours} 小时，已跳过。"
+                    " 需要立即更新请使用 POST /refresh?force=true 。"
+                ),
+            }
+
     if mode == "incremental":
-        return _refresh_market_data_incremental()
+        summary = _refresh_market_data_incremental()
+        _write_market_refresh_unix()
+        return summary
     if mode != "full":
         raise ValueError("refresh mode must be either 'full' or 'incremental'")
 
     daily = load_tushare_daily(refresh=True)
     names = load_stock_names(refresh=True)
+    _write_market_refresh_unix()
 
     return {
         "mode": "full",

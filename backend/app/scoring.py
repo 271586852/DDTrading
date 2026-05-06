@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict
+from typing import Callable, Dict
 import logging
 
 import polars as pl
@@ -20,6 +20,14 @@ REQUIRED_COLUMNS = ["ticker", "name", "pe_ratio", "momentum_20d", "volatility"]
 
 LOGGER = logging.getLogger(__name__)
 SINGLE_STOCK_ONLY_STRATEGY_ID = "single_stock_only"
+
+ProgressFn = Callable[[int, str], None]
+
+
+def _report_progress(cb: ProgressFn | None, pct: int, msg: str) -> None:
+    if cb is None:
+        return
+    cb(max(0, min(100, int(pct))), msg)
 
 
 def _required_fetch_days(lookback_days: int) -> int:
@@ -160,7 +168,7 @@ def _build_single_symbol_dataset(symbol: str, *, lookback_days: int = 20) -> pl.
     one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
     min_rows = lookback_days + 1
     if one_daily.height < min_rows:
-        refresh_market_data(mode="incremental")
+        refresh_market_data(mode="incremental", force=True)
         daily = load_tushare_daily()
         one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
         if one_daily.height < min_rows:
@@ -257,7 +265,12 @@ def _score_single_stock_only(
     }
 
 
-def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
+def score_stocks(
+    payload: ScoreRequest,
+    top_n: int = 50,
+    *,
+    progress: ProgressFn | None = None,
+) -> Dict[str, object]:
     raw_weights, applied_strategy = _raw_weights(payload)
     total_abs = sum(abs(v) for v in raw_weights.values())
     weights = {
@@ -268,10 +281,11 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
     target_symbol = (payload.symbol or "").strip()
     lookback_days = get_strategy_lookback_days(payload.strategy_id)
 
-    # 全市场分析：默认先增量更新再分析。
+    _report_progress(progress, 1, "准备评分…")
+
+    # 全市场分析：只读本地 parquet；行情更新请单独 POST /refresh。
     if not target_symbol:
-        from app.market_data import refresh_market_data
-        refresh_market_data(mode="incremental")
+        _report_progress(progress, 8, "使用本地缓存评分（未自动刷新行情）…")
 
     if (
         applied_strategy is not None
@@ -279,6 +293,7 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
     ):
         if not target_symbol:
             raise ValueError("strategy 'single_stock_only' requires a non-empty symbol.")
+        _report_progress(progress, 10, "单股专用策略评分…")
         normalized = _normalize_ticker_input(target_symbol)
         from app.market_data import _is_etf_symbol
         if _is_etf_symbol(normalized):
@@ -300,15 +315,20 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
                 for key, value in applied_strategy.weights().items()
             },
         }
+        _report_progress(progress, 100, "完成")
         return result
 
     dataset: pl.DataFrame | None = None
     scored: pl.DataFrame | None = None
     try:
+        _report_progress(progress, 32, "加载评分数据集…")
         dataset = load_dataset()
+        _report_progress(progress, 58, "计算横截面排名…")
         scored = _rank_dataset(dataset, weights)
+        _report_progress(progress, 78, "排名计算完成")
     except Exception:
         if target_symbol:
+            _report_progress(progress, 40, "全量数据集不可用，尝试单股口径…")
             normalized = _normalize_ticker_input(target_symbol)
             result = _score_single_stock_only(
                 normalized,
@@ -325,6 +345,7 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
                         for key, value in applied_strategy.weights().items()
                     },
                 }
+            _report_progress(progress, 100, "完成")
             return result
         raise
 
@@ -349,6 +370,7 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
                 "symbol %s miss in scoring dataset; trying on-demand cache fill",
                 normalized,
             )
+            _report_progress(progress, 50, "按需补齐单股缓存…")
             try:
                 on_demand_ensured = ensure_symbol_cached(
                     normalized,
@@ -362,7 +384,9 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
                     f"failed: {exc}"
                 ) from exc
 
+            _report_progress(progress, 68, "重新加载评分数据集…")
             dataset = load_dataset()
+            _report_progress(progress, 82, "重新计算排名…")
             scored = _rank_dataset(dataset, weights)
             matched = scored.filter(pl.col("ticker") == normalized)
             if matched.height == 0:
@@ -414,4 +438,6 @@ def score_stocks(payload: ScoreRequest, top_n: int = 50) -> Dict[str, object]:
             },
         }
 
+    _report_progress(progress, 98, "汇总结果…")
+    _report_progress(progress, 100, "完成")
     return result

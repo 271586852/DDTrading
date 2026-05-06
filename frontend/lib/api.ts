@@ -5,6 +5,8 @@ import type {
   TradeStrategyInfo,
 } from "@/types/backtest";
 import type {
+  MarketScoreJobStarted,
+  MarketScoreJobStatus,
   QuoteResponse,
   RefreshMode,
   RefreshResponse,
@@ -65,6 +67,23 @@ export function scoreMarket(strategyId: string): Promise<ScoreResponse> {
   });
 }
 
+export function startMarketScoreJob(
+  strategyId: string,
+): Promise<MarketScoreJobStarted> {
+  return request<MarketScoreJobStarted>("/score/market-job", {
+    method: "POST",
+    body: JSON.stringify({ strategy_id: strategyId }),
+  });
+}
+
+export function getMarketScoreJob(
+  jobId: string,
+): Promise<MarketScoreJobStatus> {
+  return request<MarketScoreJobStatus>(
+    `/score/market-job/${encodeURIComponent(jobId)}`,
+  );
+}
+
 export function scoreSingle(
   strategyId: string,
   symbol: string,
@@ -82,9 +101,13 @@ export function fetchQuote(symbol: string, bars = 120): Promise<QuoteResponse> {
 
 export function refreshMarketData(
   mode: RefreshMode = "incremental",
+  options?: { force?: boolean },
 ): Promise<RefreshResponse> {
-  const qs = new URLSearchParams({ mode }).toString();
-  return request<RefreshResponse>(`/refresh?${qs}`, {
+  const qs = new URLSearchParams({ mode });
+  if (options?.force) {
+    qs.set("force", "true");
+  }
+  return request<RefreshResponse>(`/refresh?${qs.toString()}`, {
     method: "POST",
   });
 }

@@ -6,10 +6,11 @@ import {
   ApiError,
   classifySymbol,
   fetchQuote,
+  getMarketScoreJob,
   listScoreStrategies,
   normalizeSymbol,
-  scoreMarket,
   scoreSingle,
+  startMarketScoreJob,
 } from "@/lib/api";
 import type {
   HistoryEntry,
@@ -135,6 +136,10 @@ type ScoringStore = {
   marketRanking: RankedStock[] | null;
   marketLoading: boolean;
   marketError: string | null;
+  /** 用于在用户关闭弹窗时作废正在轮询的全市场任务 */
+  marketGeneration: number;
+  marketProgress: number;
+  marketStage: string | null;
 
   history: HistoryEntry[];
   selectedHistoryId: string | null;
@@ -177,6 +182,9 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
   marketRanking: null,
   marketLoading: false,
   marketError: null,
+  marketGeneration: 0,
+  marketProgress: 0,
+  marketStage: null,
 
   history: typeof window === "undefined" ? [] : loadHistory(),
   selectedHistoryId: null,
@@ -353,40 +361,110 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
       set((state) => ({ ...state, marketError: "请先选择一个评分策略" }));
       return;
     }
-    set((state) => ({
-      ...state,
-      marketLoading: true,
-      marketError: null,
-      marketRanking: [],
-    }));
-    try {
-      const payload = await scoreMarket(strategyId);
-      set((state) => ({
+    let session = 0;
+    set((state) => {
+      session = state.marketGeneration + 1;
+      return {
         ...state,
-        marketLoading: false,
-        marketRanking: payload.top_50,
-      }));
-    } catch (err) {
-      const message =
-        err instanceof ApiError && err.status === 500
-          ? `后端无法加载评分数据集，请确认 /refresh 已成功执行。(${err.message})`
-          : err instanceof Error
-            ? err.message
-            : "全市场分析失败";
+        marketGeneration: session,
+        marketLoading: true,
+        marketError: null,
+        marketRanking: [],
+        marketProgress: 0,
+        marketStage: "正在创建任务…",
+      };
+    });
+    const stale = () => get().marketGeneration !== session;
+
+    const fail = (message: string) => {
+      if (stale()) return;
       set((state) => ({
         ...state,
         marketLoading: false,
         marketError: message,
         marketRanking: null,
+        marketStage: null,
       }));
+    };
+
+    let jobId: string;
+    try {
+      const started = await startMarketScoreJob(strategyId);
+      jobId = started.job_id;
+    } catch (err) {
+      const message =
+        err instanceof ApiError && err.status === 500
+          ? `后端无法启动评分任务，请确认 /refresh 已成功执行。(${err.message})`
+          : err instanceof Error
+            ? err.message
+            : "全市场分析失败";
+      fail(message);
+      return;
+    }
+
+    const deadline = Date.now() + 30 * 60 * 1000;
+    const pollMs = 400;
+
+    try {
+      while (Date.now() < deadline) {
+        if (stale()) return;
+        let status;
+        try {
+          status = await getMarketScoreJob(jobId);
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 404) {
+            fail("任务不存在或已过期，请重试。");
+            return;
+          }
+          throw err;
+        }
+        if (stale()) return;
+        set((state) => ({
+          ...state,
+          marketProgress: status.progress,
+          marketStage: status.stage || null,
+        }));
+        if (status.status === "completed") {
+          if (!status.result?.top_50) {
+            fail("任务已完成但未返回评分结果。");
+            return;
+          }
+          set((state) => ({
+            ...state,
+            marketLoading: false,
+            marketRanking: status.result!.top_50,
+            marketProgress: 100,
+            marketStage: "完成",
+          }));
+          return;
+        }
+        if (status.status === "failed") {
+          const detail = status.error ?? "全市场分析失败";
+          fail(
+            detail.includes("dataset") || detail.includes("parquet")
+              ? `后端无法加载评分数据集，请确认 /refresh 已成功执行。（${detail}）`
+              : detail,
+          );
+          return;
+        }
+        await new Promise((r) => setTimeout(r, pollMs));
+      }
+      fail("全市场分析超时（超过 30 分钟），请检查后端日志或缩小股票池后重试。");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "全市场分析失败";
+      fail(message);
     }
   },
 
   closeMarketRanking: () =>
     set((state) => ({
       ...state,
+      marketGeneration: state.marketGeneration + 1,
       marketRanking: null,
       marketError: null,
+      marketLoading: false,
+      marketProgress: 0,
+      marketStage: null,
     })),
 
   restoreHistory: async (entryId) => {
