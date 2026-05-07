@@ -6,6 +6,7 @@ import {
   ApiError,
   classifySymbol,
   fetchQuote,
+  getMarketDataRevision,
   getMarketScoreJob,
   listScoreStrategies,
   normalizeSymbol,
@@ -25,6 +26,91 @@ const HISTORY_KEY = "ddt.history.v1";
 const HISTORY_LIMIT = 30;
 const SCORE_CACHE_KEY = "ddt.score-cache.v1";
 const SCORE_CACHE_LIMIT = 120;
+
+/** 全市场评分结果（按策略），与单股 SCORE_CACHE 分开存储 */
+const MARKET_SCORE_CACHE_KEY = "ddt.market-score.v1";
+/** 最多保留多少个策略的缓存条目（LRU 按 cachedAt） */
+const MARKET_SCORE_CACHE_MAX_STRATEGIES = 12;
+
+type MarketScoreCached = {
+  strategyId: string;
+  /** 与后端 market_data_revision 一致；仅当与当前 GET /market-data-revision 相等时视为命中 */
+  dataRevision: number;
+  cachedAt: number;
+  result: Pick<
+    ScoreResponse,
+    | "top_50"
+    | "normalized_weights"
+    | "total_universe"
+    | "returned_count"
+    | "mode"
+  > & { applied_strategy?: StrategyInfo | null };
+};
+
+type MarketScoreCacheRoot = {
+  v: 1;
+  byStrategy: Record<string, MarketScoreCached>;
+};
+
+function loadMarketScoreCacheRoot(): MarketScoreCacheRoot {
+  if (typeof window === "undefined") return { v: 1, byStrategy: {} };
+  try {
+    const raw = window.localStorage.getItem(MARKET_SCORE_CACHE_KEY);
+    if (!raw) return { v: 1, byStrategy: {} };
+    const parsed = JSON.parse(raw) as MarketScoreCacheRoot;
+    if (parsed?.v !== 1 || typeof parsed.byStrategy !== "object") {
+      return { v: 1, byStrategy: {} };
+    }
+    return parsed;
+  } catch {
+    return { v: 1, byStrategy: {} };
+  }
+}
+
+function loadMarketScoreCache(strategyId: string): MarketScoreCached | null {
+  const root = loadMarketScoreCacheRoot();
+  const c = root.byStrategy[strategyId];
+  if (!c || c.strategyId !== strategyId) return null;
+  if (typeof c.dataRevision !== "number" || Number.isNaN(c.dataRevision)) {
+    return null;
+  }
+  if (!Array.isArray(c.result?.top_50) || c.result.top_50.length === 0) {
+    return null;
+  }
+  return c;
+}
+
+function persistMarketScoreCache(strategyId: string, result: ScoreResponse): void {
+  if (typeof window === "undefined") return;
+  try {
+    const root = loadMarketScoreCacheRoot();
+    root.byStrategy[strategyId] = {
+      strategyId,
+      dataRevision: Number(result.market_data_revision ?? 0),
+      cachedAt: Date.now(),
+      result: {
+        top_50: result.top_50,
+        normalized_weights: result.normalized_weights,
+        total_universe: result.total_universe,
+        returned_count: result.returned_count,
+        mode: result.mode,
+        applied_strategy: result.applied_strategy ?? null,
+      },
+    };
+    const sorted = Object.entries(root.byStrategy).sort(
+      (a, b) => b[1].cachedAt - a[1].cachedAt,
+    );
+    root.byStrategy = Object.fromEntries(
+      sorted.slice(0, MARKET_SCORE_CACHE_MAX_STRATEGIES),
+    );
+    window.localStorage.setItem(
+      MARKET_SCORE_CACHE_KEY,
+      JSON.stringify(root),
+    );
+  } catch {
+    // ignore quota / private mode
+  }
+}
 
 type ScoreCacheMode = "single" | "etf-skip";
 
@@ -361,9 +447,39 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
       set((state) => ({ ...state, marketError: "请先选择一个评分策略" }));
       return;
     }
+
+    let currentRevision: number;
+    try {
+      const rev = await getMarketDataRevision();
+      currentRevision = Number(rev.market_data_revision);
+      if (Number.isNaN(currentRevision)) {
+        currentRevision = Number.NaN;
+      }
+    } catch {
+      currentRevision = Number.NaN;
+    }
+
+    const cached = loadMarketScoreCache(strategyId);
+    const cacheFresh =
+      cached !== null &&
+      !Number.isNaN(currentRevision) &&
+      cached.dataRevision === currentRevision;
+
     let session = 0;
     set((state) => {
       session = state.marketGeneration + 1;
+      if (cacheFresh) {
+        const t = new Date(cached!.cachedAt).toLocaleString();
+        return {
+          ...state,
+          marketGeneration: session,
+          marketLoading: false,
+          marketError: null,
+          marketRanking: cached!.result.top_50,
+          marketProgress: 100,
+          marketStage: `来自本地缓存（${t}，全市场数据版本未变）`,
+        };
+      }
       return {
         ...state,
         marketGeneration: session,
@@ -374,6 +490,11 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
         marketStage: "正在创建任务…",
       };
     });
+
+    if (cacheFresh) {
+      return;
+    }
+
     const stale = () => get().marketGeneration !== session;
 
     const fail = (message: string) => {
@@ -429,6 +550,7 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
             fail("任务已完成但未返回评分结果。");
             return;
           }
+          persistMarketScoreCache(strategyId, status.result);
           set((state) => ({
             ...state,
             marketLoading: false,

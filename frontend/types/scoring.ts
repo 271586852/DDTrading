@@ -37,6 +37,12 @@ export type ScoreResponse = {
   mode: ScoreMode;
   top_50: RankedStock[];
   applied_strategy?: StrategyInfo | null;
+  /** 与 GET /market-data-revision 一致；本地数据更新后变大，用于全市场结果缓存失效 */
+  market_data_revision: number;
+};
+
+export type MarketDataRevisionResponse = {
+  market_data_revision: number;
 };
 
 export type MarketScoreJobStarted = {
