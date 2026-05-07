@@ -6,6 +6,7 @@ import logging
 
 import polars as pl
 
+from app.market_data import get_market_data_cache_revision
 from app.schemas import ScoreRequest
 from app.strategies import ScoringStrategy, get_strategy, get_strategy_lookback_days
 
@@ -22,6 +23,12 @@ LOGGER = logging.getLogger(__name__)
 SINGLE_STOCK_ONLY_STRATEGY_ID = "single_stock_only"
 
 ProgressFn = Callable[[int, str], None]
+
+
+def _finalize_score_payload(d: Dict[str, object]) -> Dict[str, object]:
+    out: Dict[str, object] = dict(d)
+    out["market_data_revision"] = get_market_data_cache_revision()
+    return out
 
 
 def _report_progress(cb: ProgressFn | None, pct: int, msg: str) -> None:
@@ -316,7 +323,7 @@ def score_stocks(
             },
         }
         _report_progress(progress, 100, "完成")
-        return result
+        return _finalize_score_payload(result)
 
     dataset: pl.DataFrame | None = None
     scored: pl.DataFrame | None = None
@@ -440,4 +447,4 @@ def score_stocks(
 
     _report_progress(progress, 98, "汇总结果…")
     _report_progress(progress, 100, "完成")
-    return result
+    return _finalize_score_payload(result)

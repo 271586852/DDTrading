@@ -82,6 +82,10 @@ class ScoreResponse(BaseModel):
         default=None,
         description="当通过 strategy_id 选中预设时回显的策略元信息。",
     )
+    market_data_revision: float = Field(
+        default=0.0,
+        description="本地全市场数据版本号（刷新标记与日线 parquet mtime 较大者）；客户端据此判断缓存是否仍有效。",
+    )
 
 
 class MarketScoreJobStarted(BaseModel):
