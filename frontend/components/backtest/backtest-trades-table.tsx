@@ -2,6 +2,10 @@
 
 import { ArrowDown, ArrowUp } from "lucide-react";
 
+import {
+  BacktestTablePager,
+  useClientPagination,
+} from "@/components/backtest/backtest-table-pager";
 import type { BacktestResponse } from "@/types/backtest";
 
 type TradeRow = {
@@ -34,9 +38,19 @@ function fmtDate(value: unknown): string {
 }
 
 export function BacktestTradesTable({ result }: { result: BacktestResponse }) {
-  const rows = (result.recent_trades as TradeRow[]) ?? [];
+  const allRows = (result.recent_trades as TradeRow[]) ?? [];
+  const {
+    page,
+    setPage,
+    pageSize,
+    setPageSize,
+    pageItems,
+    total,
+    totalPages,
+    offset,
+  } = useClientPagination(allRows, 25);
 
-  if (!rows.length) {
+  if (!allRows.length) {
     return (
       <section className="glass-panel rounded-[24px] border border-white/5 p-6">
         <p className="text-sm text-slate-400">该策略在此区间内没有产生交易。</p>
@@ -52,7 +66,7 @@ export function BacktestTradesTable({ result }: { result: BacktestResponse }) {
             Recent Trades
           </p>
           <h2 className="text-lg font-semibold tracking-tight text-white">
-            最近 {rows.length} 笔成交
+            全部 {total} 笔成交
           </h2>
         </div>
         <span className="text-[11px] text-slate-500">时间倒序</span>
@@ -74,13 +88,13 @@ export function BacktestTradesTable({ result }: { result: BacktestResponse }) {
             </tr>
           </thead>
           <tbody>
-            {rows.map((row, idx) => {
+            {pageItems.map((row, idx) => {
               const pnl = row.net_pnl ?? row.pnl ?? 0;
               const isWin = pnl > 0;
               const isLoss = pnl < 0;
               return (
                 <tr
-                  key={`${row.entry_time ?? idx}-${idx}`}
+                  key={`${row.entry_time ?? "row"}-${offset + idx}`}
                   className="border-b border-white/5 last:border-none hover:bg-slate-900/40"
                 >
                   <Td>
@@ -148,6 +162,15 @@ export function BacktestTradesTable({ result }: { result: BacktestResponse }) {
           </tbody>
         </table>
       </div>
+
+      <BacktestTablePager
+        page={page}
+        totalPages={totalPages}
+        total={total}
+        pageSize={pageSize}
+        onPageChange={setPage}
+        onPageSizeChange={setPageSize}
+      />
     </section>
   );
 }

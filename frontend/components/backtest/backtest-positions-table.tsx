@@ -1,5 +1,9 @@
 "use client";
 
+import {
+  BacktestTablePager,
+  useClientPagination,
+} from "@/components/backtest/backtest-table-pager";
 import type { BacktestResponse } from "@/types/backtest";
 
 type PositionRow = Record<string, unknown>;
@@ -27,8 +31,19 @@ function fmtDate(value: unknown): string {
 }
 
 export function BacktestPositionsTable({ result }: { result: BacktestResponse }) {
-  const rows = result.daily_positions ?? [];
-  if (!rows.length) {
+  const allRows = result.daily_positions ?? [];
+  const {
+    page,
+    setPage,
+    pageSize,
+    setPageSize,
+    pageItems,
+    total,
+    totalPages,
+    offset,
+  } = useClientPagination(allRows, 25);
+
+  if (!allRows.length) {
     return (
       <section className="glass-panel rounded-[24px] border border-white/5 p-6">
         <p className="text-sm text-slate-400">暂无每日持仓详情数据。</p>
@@ -44,7 +59,7 @@ export function BacktestPositionsTable({ result }: { result: BacktestResponse })
             Daily Positions
           </p>
           <h2 className="text-lg font-semibold tracking-tight text-white">
-            每日持仓详情（最近 {rows.length} 天）
+            每日持仓详情（共 {total} 条）
           </h2>
         </div>
       </header>
@@ -64,9 +79,9 @@ export function BacktestPositionsTable({ result }: { result: BacktestResponse })
             </tr>
           </thead>
           <tbody>
-            {rows.map((row, idx) => (
+            {pageItems.map((row, idx) => (
               <tr
-                key={`${pick(row, ["date", "timestamp"]) ?? idx}-${idx}`}
+                key={`${String(pick(row, ["date", "timestamp"]) ?? "row")}-${offset + idx}`}
                 className="border-b border-white/5 last:border-none hover:bg-slate-900/40"
               >
                 <td className="px-3 py-2.5 font-mono text-xs text-slate-300">
@@ -98,6 +113,15 @@ export function BacktestPositionsTable({ result }: { result: BacktestResponse })
           </tbody>
         </table>
       </div>
+
+      <BacktestTablePager
+        page={page}
+        totalPages={totalPages}
+        total={total}
+        pageSize={pageSize}
+        onPageChange={setPage}
+        onPageSizeChange={setPageSize}
+      />
     </section>
   );
 }
