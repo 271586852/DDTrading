@@ -1,22 +1,22 @@
 """单只股票回测封装。
 
-基于 :mod:`akquant` 运行简单的"有仓则卖、无仓则买" 100 股策略；数据直接取自
-:func:`app.market_data.load_ashare_daily` 维护的日线 parquet。主要职责：
+基于 :mod:`akquant` 运行策略；数据取自本地日线 parquet。主要职责：
 
-- 把用户请求的 ``[start_date, end_date]`` clamp 到该股票在 parquet 里的可用
-  区间，避免请求超出数据范围时直接报错。
-- 结果中返回核心指标（``BacktestMetrics``），以及最近 100 条交易明细和最近 100
-  条持仓快照（时间倒序，方便前端直接展示"最新先"）。
+- 将 ``[start_date, end_date]`` clamp 到可用数据区间。
+- 返回指标、权益曲线、**全量**成交明细（时间倒序）与**全量**每日持仓（升序），
+  供前端与导出报告内分页展示。
 """
 from __future__ import annotations
 
+import html
 import logging
 import math
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import polars as pl
 
@@ -41,9 +41,6 @@ from app.trade_strategies import (
 
 LOGGER = logging.getLogger(__name__)
 
-MAX_DETAIL_ROWS = 100
-MAX_DAILY_POSITION_ROWS = 2000
-
 
 def _to_date(value: Any) -> date:
     if isinstance(value, date) and not isinstance(value, datetime):
@@ -66,39 +63,284 @@ def _sanitize_value(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, date):
         return value.isoformat()
+    # 持仓/成交里常见 duration 列，json.dumps 无法序列化 Timedelta
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    if isinstance(value, pd.Timedelta):
+        if pd.isna(value):
+            return None
+        try:
+            return float(value.total_seconds())
+        except (ValueError, OverflowError):
+            return str(value)
+    if isinstance(value, np.timedelta64):
+        td = pd.to_timedelta(value, errors="coerce")
+        if pd.isna(td):
+            return None
+        try:
+            return float(td.total_seconds())
+        except (ValueError, OverflowError, TypeError):
+            return str(value)
     if hasattr(value, "item") and not isinstance(value, (str, bytes)):
         # numpy scalar
         try:
-            return value.item()
+            out = value.item()
         except Exception:  # noqa: BLE001
             return str(value)
+        if isinstance(out, (np.timedelta64, pd.Timedelta, timedelta)):
+            return _sanitize_value(out)
+        if isinstance(out, (datetime, date, pd.Timestamp)):
+            return _sanitize_value(out)
+        return out
     return value
 
 
-def _records(frame: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
+def _dataframe_records_sanitized(frame: pd.DataFrame) -> list[dict[str, Any]]:
     if frame is None or frame.empty:
         return []
-    tail = frame.tail(limit).iloc[::-1]  # 倒序：最新在前
-    return [
-        {col: _sanitize_value(row[col]) for col in tail.columns}
-        for _, row in tail.iterrows()
-    ]
+    records = frame.to_dict(orient="records")
+    return [{k: _sanitize_value(v) for k, v in row.items()} for row in records]
 
 
-def _records_asc(frame: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
-    """按时间升序取最近 N 行，便于展示每日持仓明细。"""
-    if frame is None or frame.empty:
+def _trades_records_desc(trades_df: pd.DataFrame) -> list[dict[str, Any]]:
+    """全部成交，时间倒序（最新在前）。"""
+    if trades_df is None or trades_df.empty:
         return []
-    sorted_frame = frame
+    return _dataframe_records_sanitized(trades_df.iloc[::-1])
+
+
+def _positions_records_asc_full(positions_df: pd.DataFrame) -> list[dict[str, Any]]:
+    """全部持仓行，按日期/时间列升序。"""
+    if positions_df is None or positions_df.empty:
+        return []
+    sorted_frame = positions_df
     for col in ("date", "timestamp", "time"):
-        if col in frame.columns:
-            sorted_frame = frame.sort_values(col)
+        if col in positions_df.columns:
+            sorted_frame = positions_df.sort_values(col)
             break
-    tail = sorted_frame.tail(limit)
-    return [
-        {col: _sanitize_value(row[col]) for col in tail.columns}
-        for _, row in tail.iterrows()
-    ]
+    return _dataframe_records_sanitized(sorted_frame)
+
+
+def _deep_scrub_for_json(obj: Any) -> Any:
+    """递归清洗，使输出符合 RFC 8259，便于浏览器 ``JSON.parse``（拒绝 NaN/Infinity）。"""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {str(k): _deep_scrub_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_deep_scrub_for_json(v) for v in obj]
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int) and not isinstance(obj, bool):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (np.integer, np.floating)):
+        x = obj.item()
+        if isinstance(x, float) and not math.isfinite(x):
+            return None
+        return x
+    if isinstance(obj, (datetime, date, pd.Timestamp, pd.Timedelta, timedelta, np.timedelta64)):
+        return _sanitize_value(obj)
+    try:
+        if obj is pd.NA:
+            return None
+    except (AttributeError, TypeError):
+        pass
+    try:
+        if pd.isna(obj):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return str(obj)
+
+
+REPORT_APPENDIX_PAGE_SIZE = 25
+
+
+def _html_text(value: Any) -> str:
+    if value is None:
+        return "--"
+    return html.escape(str(value), quote=True)
+
+
+def _report_fmt_date(value: Any) -> str:
+    if value is None:
+        return "--"
+    text = str(value)
+    idx = text.find("T")
+    return _html_text(text[:idx] if idx > 0 else text[:10])
+
+
+def _report_fmt_num(value: Any, digits: int = 2) -> str:
+    if value is None:
+        return "--"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            return "--"
+        return f"{float(value):.{digits}f}"
+    return _html_text(value)
+
+
+def _pick(row: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in row:
+            return row[key]
+    return None
+
+
+def _chunked(rows: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
+    if not rows:
+        return [[]]
+    return [rows[i : i + size] for i in range(0, len(rows), size)]
+
+
+def _report_pager_html(table_id: str, total: int, pages: int) -> str:
+    return f"""
+  <div class="ddt-pager" data-ddt-pager="{table_id}" style="margin:.75rem 0;display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;font-size:.85rem;">
+    <span>共 {total} 条 · 第 <span data-ddt-current="{table_id}">1</span> / {pages} 页</span>
+    <button type="button" data-ddt-prev="{table_id}" disabled style="padding:.2rem .6rem;border:1px solid #94a3b8;border-radius:6px;background:#fff;cursor:pointer;">上一页</button>
+    <button type="button" data-ddt-next="{table_id}" {'disabled' if pages <= 1 else ''} style="padding:.2rem .6rem;border:1px solid #94a3b8;border-radius:6px;background:#fff;cursor:pointer;">下一页</button>
+  </div>"""
+
+
+def _trades_table_html(trades: list[dict[str, Any]]) -> str:
+    pages = _chunked(trades, REPORT_APPENDIX_PAGE_SIZE)
+    bodies: list[str] = []
+    for page_idx, page_rows in enumerate(pages, start=1):
+        body_rows: list[str] = []
+        for row in page_rows:
+            pnl = row.get("net_pnl", row.get("pnl"))
+            return_pct = row.get("return_pct")
+            ret = (
+                f"{_report_fmt_num(return_pct, 2)}%"
+                if return_pct is not None
+                else "--"
+            )
+            body_rows.append(
+                "<tr style='border-top:1px solid #e2e8f0;'>"
+                f"<td>{_html_text(row.get('side'))}</td>"
+                f"<td>{_report_fmt_date(row.get('entry_time'))}</td>"
+                f"<td>{_report_fmt_date(row.get('exit_time'))}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(row.get('entry_price'), 4)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(row.get('exit_price'), 4)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(row.get('quantity'), 0)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(pnl, 2)}</td>"
+                f"<td style='text-align:right'>{ret}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(row.get('duration_bars'), 0)}</td>"
+                "</tr>"
+            )
+        if not body_rows:
+            body_rows.append("<tr><td colspan='9' style='padding:1rem;'>无数据</td></tr>")
+        display = "" if page_idx == 1 else "display:none;"
+        bodies.append(
+            f"<tbody data-ddt-table='ddt-trades-table' data-ddt-page='{page_idx}' style='{display}'>"
+            + "".join(body_rows)
+            + "</tbody>"
+        )
+    return (
+        _report_pager_html("ddt-trades-table", len(trades), len(pages))
+        + """
+  <div style="overflow:auto;border:1px solid #e2e8f0;border-radius:8px;">
+    <table id="ddt-trades-table" style="width:100%;border-collapse:collapse;font-size:.8rem;">
+      <thead><tr style="background:#f1f5f9;"><th>方向</th><th>开仓</th><th>平仓</th><th style="text-align:right">开仓价</th><th style="text-align:right">平仓价</th><th style="text-align:right">数量</th><th style="text-align:right">净损益</th><th style="text-align:right">收益率</th><th style="text-align:right">bars</th></tr></thead>
+"""
+        + "".join(bodies)
+        + """
+    </table>
+  </div>"""
+    )
+
+
+def _positions_table_html(positions: list[dict[str, Any]]) -> str:
+    pages = _chunked(positions, REPORT_APPENDIX_PAGE_SIZE)
+    bodies: list[str] = []
+    for page_idx, page_rows in enumerate(pages, start=1):
+        body_rows: list[str] = []
+        for row in page_rows:
+            date_val = _pick(row, ("date", "timestamp", "time"))
+            body_rows.append(
+                "<tr style='border-top:1px solid #e2e8f0;'>"
+                f"<td>{_report_fmt_date(date_val)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(_pick(row, ('equity', 'market_value')), 2)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(row.get('cash'), 2)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(row.get('margin'), 2)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(_pick(row, ('positions', 'position_count', 'n_positions')), 0)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(row.get('net_exposure'), 2)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(row.get('gross_exposure'), 2)}</td>"
+                f"<td style='text-align:right'>{_report_fmt_num(row.get('leverage'), 2)}</td>"
+                "</tr>"
+            )
+        if not body_rows:
+            body_rows.append("<tr><td colspan='8' style='padding:1rem;'>无数据</td></tr>")
+        display = "" if page_idx == 1 else "display:none;"
+        bodies.append(
+            f"<tbody data-ddt-table='ddt-positions-table' data-ddt-page='{page_idx}' style='{display}'>"
+            + "".join(body_rows)
+            + "</tbody>"
+        )
+    return (
+        _report_pager_html("ddt-positions-table", len(positions), len(pages))
+        + """
+  <div style="overflow:auto;border:1px solid #e2e8f0;border-radius:8px;">
+    <table id="ddt-positions-table" style="width:100%;border-collapse:collapse;font-size:.8rem;">
+      <thead><tr style="background:#f1f5f9;"><th>日期</th><th style="text-align:right">权益</th><th style="text-align:right">现金</th><th style="text-align:right">保证金</th><th style="text-align:right">持仓数</th><th style="text-align:right">净暴露</th><th style="text-align:right">总暴露</th><th style="text-align:right">杠杆</th></tr></thead>
+"""
+        + "".join(bodies)
+        + """
+    </table>
+  </div>"""
+    )
+
+
+def _report_appendix_html(
+    trades: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+) -> str:
+    """在 akquant 报告 HTML 末尾追加：成交与持仓分页表（纯 JS + JSON）。"""
+    return f"""
+<section id="ddt-report-appendix" style="margin:2rem 1rem 4rem;font-family:system-ui,sans-serif;color:#1e293b;">
+  <h2 style="font-size:1.1rem;border-bottom:1px solid #cbd5e1;padding-bottom:.5rem;margin-top:2rem;">成交明细（分页）</h2>
+  {_trades_table_html(trades)}
+  <h2 style="font-size:1.1rem;border-bottom:1px solid #cbd5e1;padding-bottom:.5rem;margin-top:2rem;">每日持仓（分页）</h2>
+  {_positions_table_html(positions)}
+</section>
+<script>
+(function () {{
+  function initPager(tableId) {{
+    var bodies = Array.prototype.slice.call(document.querySelectorAll('tbody[data-ddt-table="' + tableId + '"]'));
+    var currentEl = document.querySelector('[data-ddt-current="' + tableId + '"]');
+    var prev = document.querySelector('[data-ddt-prev="' + tableId + '"]');
+    var next = document.querySelector('[data-ddt-next="' + tableId + '"]');
+    if (!bodies.length || !currentEl || !prev || !next) return;
+    var page = 1;
+    function show(nextPage) {{
+      page = Math.min(Math.max(1, nextPage), bodies.length);
+      bodies.forEach(function (body, idx) {{ body.style.display = idx + 1 === page ? "" : "none"; }});
+      currentEl.textContent = String(page);
+      prev.disabled = page <= 1;
+      next.disabled = page >= bodies.length;
+    }}
+    prev.addEventListener("click", function () {{ show(page - 1); }});
+    next.addEventListener("click", function () {{ show(page + 1); }});
+    show(1);
+  }}
+  initPager("ddt-trades-table");
+  initPager("ddt-positions-table");
+}})();
+</script>
+</div>
+"""
+
+
+def _inject_before_body_close(html: str, fragment: str) -> str:
+    lower = html.lower()
+    idx = lower.rfind("</body>")
+    if idx == -1:
+        return html + fragment
+    return html[:idx] + fragment + html[idx:]
 
 
 def _metric(metrics_df: pd.DataFrame, key: str, caster=float):
@@ -356,9 +598,9 @@ def run_single_symbol_backtest(
         equity_curve=_equity_curve_points(equity_series),
         price_series=_price_series_points(data),
         trade_markers=_trade_markers(trades_df),
-        recent_trades=_records(trades_df, MAX_DETAIL_ROWS),
-        recent_positions=_records(positions_df, MAX_DETAIL_ROWS),
-        daily_positions=_records_asc(positions_df, MAX_DAILY_POSITION_ROWS),
+        recent_trades=_trades_records_desc(trades_df),
+        recent_positions=[],
+        daily_positions=_positions_records_asc_full(positions_df),
     )
 
 
@@ -405,6 +647,12 @@ def export_single_symbol_backtest_report(
     )
     report_title = request.title or default_title
 
+    # 须在 result.report() 之前取明细：部分版本在出图后可能释放/变更底层缓存。
+    trades_df = getattr(result, "trades_df", pd.DataFrame())
+    positions_df = getattr(result, "positions_df", pd.DataFrame())
+    trade_records = _trades_records_desc(trades_df)
+    position_records = _positions_records_asc_full(positions_df)
+
     with tempfile.TemporaryDirectory(prefix="ddtrading-report-") as tmpdir:
         out_path = Path(tmpdir) / "backtest_report.html"
         result.report(
@@ -414,4 +662,6 @@ def export_single_symbol_backtest_report(
             compact_currency=True,
             curve_freq=request.curve_freq,
         )
-        return out_path.read_text(encoding="utf-8")
+        html = out_path.read_text(encoding="utf-8")
+        appendix = _report_appendix_html(trade_records, position_records)
+        return _inject_before_body_close(html, appendix)
