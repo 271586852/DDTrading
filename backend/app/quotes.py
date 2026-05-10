@@ -1,6 +1,6 @@
 """单只代码的报价 / 近期 K 线读取层。
 
-纯 parquet 消费者：从 ``ashare_daily.parquet`` + ``stock_names.parquet`` 取数，
+纯本地缓存消费者：从 DuckDB 的 daily_bars + stock_names 取数，
 不联网。用于前端主分析卡展示价格、涨跌幅、最近 N 根 K 线。
 
 - 代码未落在缓存中 → ``KeyError``（API 层映射 404）。
@@ -13,7 +13,7 @@ from typing import Any
 
 import polars as pl
 
-from app.config import get_tushare_daily_parquet_path
+from app import market_repository as repo
 from app.market_data import (
     _is_etf_symbol,
     _is_stock_symbol,
@@ -26,11 +26,8 @@ DEFAULT_HISTORY_BARS = 120
 
 
 def _resolve_name(symbol: str) -> str | None:
-    path = get_tushare_daily_parquet_path().parent / "stock_names.parquet"
-    if not path.exists():
-        return None
     try:
-        names = pl.read_parquet(path)
+        names = repo.load_names()
     except Exception:  # noqa: BLE001  - 名称缺失不是致命错误
         return None
 
@@ -75,7 +72,7 @@ def _iso_date(value: Any) -> str | None:
 
 
 def fetch_quote(symbol: str, *, bars: int = DEFAULT_HISTORY_BARS) -> dict[str, Any]:
-    """从本地 parquet 取单只标的的报价快照 + 近期 K 线。
+    """从本地 DuckDB 缓存取单只标的的报价快照 + 近期 K 线。
 
     返回结构：
     ``{"symbol", "name", "kind", "latest_close", "prev_close", "change_pct",
@@ -85,39 +82,20 @@ def fetch_quote(symbol: str, *, bars: int = DEFAULT_HISTORY_BARS) -> dict[str, A
     """
     normalized = _normalize_symbol(symbol)
 
-    path = get_tushare_daily_parquet_path()
-    if path.exists():
-        daily = pl.read_parquet(path)
-    else:
-        daily = pl.DataFrame(
-            schema={
-                "date": pl.Datetime,
-                "open": pl.Float64,
-                "high": pl.Float64,
-                "low": pl.Float64,
-                "close": pl.Float64,
-                "volume": pl.Float64,
-                "symbol": pl.Utf8,
-            }
-        )
-
     sliced = (
-        daily.filter(pl.col("symbol") == normalized)
-        .sort("date")
+        repo.load_daily_for_symbol(normalized)
         .tail(max(bars, 2))
     )
     if sliced.height == 0 and _is_stock_symbol(normalized) and not _is_etf_symbol(normalized):
         ensure_symbol_cached(normalized)
-        daily = pl.read_parquet(path)
         sliced = (
-            daily.filter(pl.col("symbol") == normalized)
-            .sort("date")
+            repo.load_daily_for_symbol(normalized)
             .tail(max(bars, 2))
         )
 
     if sliced.height == 0:
         raise KeyError(
-            f"Symbol '{normalized}' has no daily bars in the parquet cache. "
+            f"Symbol '{normalized}' has no daily bars in the DuckDB cache. "
             "Please POST /refresh first."
         )
 

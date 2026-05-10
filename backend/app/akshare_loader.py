@@ -1,7 +1,7 @@
-"""评分宽表组装层（Tushare 缓存版）。
+"""评分宽表组装层（Tushare + DuckDB 缓存版）。
 
-从 :mod:`app.market_data` 维护的三张 parquet
-（``ashare_daily`` / ``stock_names`` / ``pe_snapshot``）中读取数据，计算出评分
+从 :mod:`app.market_data` 维护的三张 DuckDB 表
+（``daily_bars`` / ``stock_names`` / ``pe_snapshot``）中读取数据，计算出评分
 所需的因子（``momentum_20d``、``volatility``），并与静态字段（``name``、
 ``pe_ratio``）合并成一张宽表：
 
@@ -15,7 +15,6 @@ import logging
 
 import pandas as pd
 import polars as pl
-from akquant import talib as ak_talib
 
 from app.market_data import load_tushare_daily, load_pe_snapshot, load_stock_names
 
@@ -32,21 +31,15 @@ def _compute_latest_factors_from_close(
     momentum_lookback: int,
     volatility_lookback: int,
 ) -> tuple[float, float] | None:
-    roc_series = ak_talib.ROC(close, timeperiod=momentum_lookback, as_series=True)
-    std_series = ak_talib.STDDEV(
-        close,
-        timeperiod=volatility_lookback,
-        as_series=True,
-    )
-    sma_series = ak_talib.SMA(
-        close,
-        timeperiod=volatility_lookback,
-        as_series=True,
-    )
+    clean = pd.to_numeric(close, errors="coerce").dropna().astype(float)
+    min_required = max(momentum_lookback, volatility_lookback) + 1
+    if clean.shape[0] < min_required:
+        return None
 
-    momentum_val = pd.to_numeric(roc_series, errors="coerce").iloc[-1]
-    std_val = pd.to_numeric(std_series, errors="coerce").iloc[-1]
-    sma_val = pd.to_numeric(sma_series, errors="coerce").iloc[-1]
+    momentum_val = (clean.iloc[-1] / clean.iloc[-momentum_lookback - 1] - 1.0) * 100.0
+    window = clean.iloc[-volatility_lookback:]
+    std_val = window.std(ddof=0)
+    sma_val = window.mean()
     volatility_val = (
         float(std_val) / float(sma_val)
         if not pd.isna(std_val) and not pd.isna(sma_val) and float(sma_val) != 0.0
@@ -80,10 +73,10 @@ def compute_latest_factors_from_daily(
 
 
 def _compute_factors(daily: pl.DataFrame) -> pl.DataFrame:
-    """按 symbol 分组计算 momentum_20d 和 volatility（AKQuant 版本）。
+    """按 symbol 分组计算 momentum_20d 和 volatility。
 
-    - ``momentum_20d``: ``akquant.talib.ROC(close, 20)`` 最新值（百分比转小数）
-    - ``volatility``: ``akquant.talib.STDDEV(close, 20) / SMA(close, 20)`` 最新值
+    - ``momentum_20d``: 近 20 根收盘价涨跌幅
+    - ``volatility``: 近 20 根收盘价标准差 / 均值
     """
     if daily.height == 0:
         return pl.DataFrame(
@@ -162,9 +155,9 @@ def _assemble(
 def load_tushare_dataset(
     universe_size: int,
 ) -> pl.DataFrame:
-    """组装评分宽表（纯读 parquet，不联网）。
+    """组装评分宽表（优先读 DuckDB 缓存）。
 
-    若对应 parquet 不存在或已过期，会联网重建；期望常规情况下由
+    若对应本地缓存不存在或已过期，会联网重建；期望常规情况下由
     ``/refresh`` 端点提前触发。
     """
     daily = load_tushare_daily()
@@ -181,7 +174,7 @@ def load_tushare_dataset(
 
     if dataset.height == 0:
         raise RuntimeError(
-            "Assembled dataset is empty. Ensure daily/pe/names parquet files "
+            "Assembled dataset is empty. Ensure daily/pe/names DuckDB tables "
             "are populated (run POST /refresh first)."
         )
 
