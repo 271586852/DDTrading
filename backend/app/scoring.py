@@ -94,7 +94,7 @@ def load_dataset() -> pl.DataFrame:
     # 评分宽表统一来自 Tushare 驱动的 DuckDB 组装层。
     from app.akshare_loader import load_tushare_dataset
 
-    dataset = load_tushare_dataset(universe_size=0)
+    dataset = load_tushare_dataset()
     return _validate_dataset(dataset, source_name="tushare")
 
 

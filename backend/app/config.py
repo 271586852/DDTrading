@@ -5,7 +5,6 @@ from pathlib import Path
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TUSHARE_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "tushare_daily.parquet"
 DEFAULT_MARKET_DUCKDB_PATH = BACKEND_ROOT / "data" / "market.duckdb"
 DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
     "http://127.0.0.1:3000",
@@ -61,14 +60,6 @@ def get_tushare_max_requests_per_minute() -> int:
         minimum=1,
     )
     return min(parsed, TUSHARE_PLATFORM_MAX_RPM)
-
-
-def get_tushare_daily_parquet_path() -> Path:
-    """旧 parquet 路径配置，保留给历史脚本兼容；主数据层已迁移到 DuckDB。"""
-    raw_path = os.getenv("DDTRADING_TUSHARE_DAILY_PARQUET_PATH")
-    if not raw_path:
-        return DEFAULT_TUSHARE_DAILY_PARQUET_PATH
-    return Path(raw_path).expanduser().resolve()
 
 
 def get_market_duckdb_path() -> Path:

@@ -134,9 +134,8 @@ def _assemble(
     factors: pl.DataFrame,
     names: pl.DataFrame,
     pe: pl.DataFrame,
-    universe_size: int | None,
 ) -> pl.DataFrame:
-    joined = (
+    return (
         factors.join(pe, on="symbol", how="inner")
         .join(names, on="symbol", how="left")
         .with_columns(pl.col("name").fill_null(pl.col("symbol")))
@@ -145,16 +144,8 @@ def _assemble(
         .drop_nulls()
     )
 
-    if universe_size is not None and universe_size > 0 and joined.height > universe_size:
-        # 没有市值/成交额列时，按 ticker 字典序截断，保持确定性。
-        joined = joined.sort("ticker").head(universe_size)
 
-    return joined
-
-
-def load_tushare_dataset(
-    universe_size: int,
-) -> pl.DataFrame:
+def load_tushare_dataset() -> pl.DataFrame:
     """组装评分宽表（优先读 DuckDB 缓存）。
 
     若对应本地缓存不存在或已过期，会联网重建；期望常规情况下由
@@ -169,7 +160,6 @@ def load_tushare_dataset(
         factors=factors,
         names=names,
         pe=pe_snapshot,
-        universe_size=universe_size,
     )
 
     if dataset.height == 0:
@@ -178,9 +168,5 @@ def load_tushare_dataset(
             "are populated (run POST /refresh first)."
         )
 
-    LOGGER.info(
-        "tushare dataset assembled: %d tickers (universe_size=%s)",
-        dataset.height,
-        universe_size,
-    )
+    LOGGER.info("tushare dataset assembled: %d tickers", dataset.height)
     return dataset

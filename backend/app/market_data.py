@@ -1125,7 +1125,3 @@ def refresh_tushare_daily() -> dict[str, int | str]:
         "symbols": dataset.select(pl.col("symbol").n_unique()).item(),
         "path": str(repo.repository_path()),
     }
-
-
-def _resolve_parquet_path() -> Path:
-    return repo.repository_path()
