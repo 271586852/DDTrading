@@ -268,6 +268,20 @@ def _write_market_refresh_unix() -> None:
     )
 
 
+def get_market_data_cache_revision() -> float:
+    """本地全市场数据版本号，供评分结果与前端缓存失效判断。
+
+    取 ``market_refresh.json`` 中的成功刷新时间与日线 parquet 的 ``mtime`` 较大者；
+    任一方更新则数值变大。
+    """
+    path = get_tushare_daily_parquet_path()
+    m_parquet = path.stat().st_mtime if path.is_file() else 0.0
+    m_refresh = _read_market_refresh_unix()
+    if m_refresh is None:
+        return float(m_parquet)
+    return float(max(m_refresh, m_parquet))
+
+
 def _within_market_refresh_cooldown() -> tuple[bool, float | None, int]:
     """若仍在冷却窗口内则 (True, last_unix, hours)；否则 (False, last_unix, hours)。"""
     hours = get_market_refresh_cooldown_hours()

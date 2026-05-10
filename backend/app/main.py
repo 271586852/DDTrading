@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.backtest import export_single_symbol_backtest_report, run_single_symbol_backtest
 from app.config import get_cors_origins
-from app.market_data import refresh_market_data
+from app.market_data import get_market_data_cache_revision, refresh_market_data
 from app.quotes import fetch_quote
 from app.schemas import (
     BacktestRequest,
@@ -48,6 +48,12 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/market-data-revision")
+def market_data_revision() -> dict[str, float]:
+    """返回当前本地全市场数据版本号，用于前端判断全市场评分缓存是否过期。"""
+    return {"market_data_revision": get_market_data_cache_revision()}
 
 
 @app.get("/score-strategies", response_model=List[StrategyInfo])

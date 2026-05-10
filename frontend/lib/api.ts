@@ -5,6 +5,7 @@ import type {
   TradeStrategyInfo,
 } from "@/types/backtest";
 import type {
+  MarketDataRevisionResponse,
   MarketScoreJobStarted,
   MarketScoreJobStatus,
   QuoteResponse,
@@ -82,6 +83,10 @@ export function getMarketScoreJob(
   return request<MarketScoreJobStatus>(
     `/score/market-job/${encodeURIComponent(jobId)}`,
   );
+}
+
+export function getMarketDataRevision(): Promise<MarketDataRevisionResponse> {
+  return request<MarketDataRevisionResponse>("/market-data-revision");
 }
 
 export function scoreSingle(

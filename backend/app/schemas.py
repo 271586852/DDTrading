@@ -82,6 +82,10 @@ class ScoreResponse(BaseModel):
         default=None,
         description="当通过 strategy_id 选中预设时回显的策略元信息。",
     )
+    market_data_revision: float = Field(
+        default=0.0,
+        description="本地全市场数据版本号（刷新标记与日线 parquet mtime 较大者）；客户端据此判断缓存是否仍有效。",
+    )
 
 
 class MarketScoreJobStarted(BaseModel):
@@ -216,15 +220,15 @@ class BacktestResponse(BaseModel):
     )
     recent_trades: List[Dict[str, Any]] = Field(
         default_factory=list,
-        description="最近 100 条交易明细（时间倒序）。",
+        description="全部成交明细（时间倒序，最新在前）；前端可本地分页展示。",
     )
     recent_positions: List[Dict[str, Any]] = Field(
         default_factory=list,
-        description="最近 100 条持仓快照（时间倒序）。",
+        description="兼容字段，当前为空列表；持仓请使用 daily_positions。",
     )
     daily_positions: List[Dict[str, Any]] = Field(
         default_factory=list,
-        description="每日持仓详情（按时间升序，来自 BacktestResult.positions_df）。",
+        description="全部每日持仓（按时间升序，来自 positions_df）；前端可本地分页展示。",
     )
 
 
