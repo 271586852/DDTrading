@@ -632,14 +632,123 @@ def _incremental_fetch_daily_bars(
     latest_dates: dict[str, datetime],
     max_workers: int,
     log_tag: str = "增量日线",
+    coverage: tuple[date, date] | None = None,
+    symbol_bounds: dict[str, tuple[date, date] | None] | None = None,
 ) -> tuple[list[pd.DataFrame], list[str], list[str]]:
-    """对给定代码列表并发拉 Tushare 增量日线；不写库。返回 (frames, failed_symbols, refreshed_symbols)。"""
+    """对给定代码列表并发拉 Tushare 增量日线；不写库。返回 (frames, failed_symbols, refreshed_symbols)。
+
+    ``coverage`` + ``symbol_bounds``：按回测区间补左侧历史或右侧更新（本地已有 last 时不再只拉末段）。
+    """
     if not symbols:
         return [], [], []
     history_days = get_daily_history_days()
     end_date = datetime.now()
     fallback_start = end_date - timedelta(days=history_days)
+    fallback_start_date = fallback_start.date()
     end_date_str = end_date.strftime("%Y%m%d")
+
+    if coverage is not None:
+        if symbol_bounds is None:
+            raise ValueError("symbol_bounds is required when coverage is set")
+        cov_start, cov_end = coverage
+        end_req_clamped = min(cov_end, end_date.date())
+        fetch_tasks: list[tuple[str, str, str]] = []
+        for symbol in symbols:
+            b = symbol_bounds[symbol]
+            if b is None:
+                start_date_eff = max(fallback_start_date, cov_start)
+                end_date_eff = end_req_clamped
+            else:
+                dmin, dmax = b
+                need_left = dmin > cov_start
+                need_right = dmax < end_req_clamped
+                if not need_left and not need_right:
+                    continue
+                if need_left and need_right:
+                    start_date_eff = max(fallback_start_date, cov_start)
+                    end_date_eff = end_req_clamped
+                elif need_left:
+                    start_date_eff = max(fallback_start_date, cov_start)
+                    end_date_eff = dmin
+                else:
+                    start_date_eff = dmax - timedelta(days=INCREMENTAL_OVERLAP_DAYS)
+                    end_date_eff = end_req_clamped
+            if start_date_eff > end_date_eff:
+                LOGGER.warning(
+                    "%s: skip %s empty fetch window [%s, %s]",
+                    log_tag,
+                    symbol,
+                    start_date_eff,
+                    end_date_eff,
+                )
+                continue
+            fetch_tasks.append(
+                (
+                    symbol,
+                    start_date_eff.strftime("%Y%m%d"),
+                    end_date_eff.strftime("%Y%m%d"),
+                )
+            )
+        total_daily_tasks = len(fetch_tasks)
+        if total_daily_tasks == 0:
+            return [], [], []
+        progress_every = max(1, min(50, total_daily_tasks // 8 or 1))
+        frames: list[pd.DataFrame] = []
+        failed: list[str] = []
+        refreshed_symbols: list[str] = []
+        t_fetch = time.monotonic()
+        LOGGER.info(
+            "%s: 按回测区间补日线 任务数=%d workers=%d coverage=[%s,%s] clamped_end=%s",
+            log_tag,
+            total_daily_tasks,
+            max_workers,
+            cov_start,
+            cov_end,
+            end_req_clamped,
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    fetch_daily_one,
+                    sym,
+                    s_str,
+                    e_str,
+                    adjust="qfq",
+                ): sym
+                for sym, s_str, e_str in fetch_tasks
+            }
+            completed = 0
+            for future in as_completed(future_map):
+                symbol = future_map[future]
+                completed += 1
+                try:
+                    frame = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("incremental daily fetch failed for %s: %s", symbol, exc)
+                    failed.append(symbol)
+                else:
+                    if not frame.empty:
+                        frames.append(frame)
+                        refreshed_symbols.append(symbol)
+                if completed % progress_every == 0 or completed == total_daily_tasks:
+                    LOGGER.info(
+                        "%s Tushare 进度: %d/%d (%.0f%%) elapsed=%.1fs",
+                        log_tag,
+                        completed,
+                        total_daily_tasks,
+                        100.0 * completed / total_daily_tasks,
+                        time.monotonic() - t_fetch,
+                    )
+        LOGGER.info(
+            "%s: Tushare 请求阶段结束 ok_rows=%d symbols=%d failed=%d elapsed=%.1fs",
+            log_tag,
+            sum(len(f) for f in frames),
+            len(set(refreshed_symbols)),
+            len(failed),
+            time.monotonic() - t_fetch,
+        )
+        return frames, failed, refreshed_symbols
+
     total_daily_tasks = len(symbols)
     progress_every = max(1, min(50, total_daily_tasks // 8 or 1))
 
@@ -709,14 +818,50 @@ def _incremental_fetch_daily_bars(
     return frames, failed, refreshed_symbols
 
 
-def incremental_daily_for_symbols(symbols: Iterable[str]) -> dict[str, object]:
+def incremental_daily_for_symbols(
+    symbols: Iterable[str],
+    *,
+    coverage: tuple[date, date] | None = None,
+    symbol_bounds: dict[str, tuple[date, date] | None] | None = None,
+) -> dict[str, object]:
     """仅更新指定代码的增量日线并写入 DuckDB；不刷新证券简称与 PE。
 
     供回测在本地缺数时按需补拉，避免 ``refresh_market_data(incremental)`` 对全市场扫一遍导致极慢。
+
+    ``coverage`` 为 ``(start, end)`` 且提供 ``symbol_bounds`` 时：按该区间向左/向右补历史（仍受
+    ``DDTRADING_DAILY_HISTORY_DAYS`` 限制，过早起始日会被裁到可拉取窗口）。
     """
     uniq = list(dict.fromkeys(_normalize_symbol(s) for s in symbols))
     if not uniq:
         return {"symbols_requested": 0, "updated_symbols": 0, "failed_symbols": []}
+
+    if coverage is not None:
+        if symbol_bounds is None:
+            raise ValueError("symbol_bounds is required when coverage is set")
+        missing = [s for s in uniq if s not in symbol_bounds]
+        if missing:
+            raise ValueError(f"symbol_bounds missing keys for symbols: {missing}")
+        cov_start, cov_end = coverage
+        today = datetime.now().date()
+        end_clamped = min(cov_end, today)
+        already_full = True
+        for s in uniq:
+            b = symbol_bounds[s]
+            if b is None:
+                already_full = False
+                break
+            dmin, dmax = b
+            if dmin > cov_start or dmax < end_clamped:
+                already_full = False
+                break
+        if already_full:
+            return {
+                "symbols_requested": len(uniq),
+                "updated_symbols": 0,
+                "failed_symbols": [],
+                "skipped": True,
+                "reason": "coverage_already_cached",
+            }
 
     max_workers = get_tushare_max_workers()
     with _CACHE_LOCK:
@@ -726,6 +871,8 @@ def incremental_daily_for_symbols(symbols: Iterable[str]) -> dict[str, object]:
             latest_dates=latest_dates,
             max_workers=max_workers,
             log_tag="回测补数日线",
+            coverage=coverage,
+            symbol_bounds=symbol_bounds,
         )
         if frames:
             updates = pl.from_pandas(

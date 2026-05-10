@@ -521,18 +521,23 @@ def _resolve_symbol_window(
 
 
 def _ensure_backtest_window_cached(symbol: str, start_req: date, end_req: date) -> None:
-    """本地优先；若区间不完整则先做增量更新再回测。"""
+    """本地优先；若区间不完整则按回测区间向 Tushare 补日线写入 DuckDB 再继续。"""
     t_load = time.perf_counter()
     sub = repo.load_daily_for_symbol(symbol)
     load_ms = (time.perf_counter() - t_load) * 1000
     if sub.height == 0:
+        bounds: tuple[date, date] | None = None
         LOGGER.info(
             "backtest ensure_cache: symbol=%s absent in DuckDB load_ms=%.1f -> incremental_daily_for_symbols",
             symbol,
             load_ms,
         )
         t_ref = time.perf_counter()
-        patch = incremental_daily_for_symbols([symbol])
+        patch = incremental_daily_for_symbols(
+            [symbol],
+            coverage=(start_req, end_req),
+            symbol_bounds={symbol: bounds},
+        )
         LOGGER.info(
             "backtest ensure_cache: incremental_daily_for_symbols done refresh_ms=%.1f summary=%s",
             (time.perf_counter() - t_ref) * 1000,
@@ -542,23 +547,30 @@ def _ensure_backtest_window_cached(symbol: str, start_req: date, end_req: date) 
 
     data_min = _to_date(sub.select(pl.col("date").min()).item())
     data_max = _to_date(sub.select(pl.col("date").max()).item())
-    if data_min > start_req or data_max < end_req:
-        LOGGER.info(
-            "backtest ensure_cache: symbol=%s req=[%s,%s] duckdb=[%s,%s] load_ms=%.1f -> incremental_daily_for_symbols",
-            symbol,
-            start_req,
-            end_req,
-            data_min,
-            data_max,
-            load_ms,
-        )
-        t_ref = time.perf_counter()
-        patch = incremental_daily_for_symbols([symbol])
-        LOGGER.info(
-            "backtest ensure_cache: incremental_daily_for_symbols done refresh_ms=%.1f summary=%s",
-            (time.perf_counter() - t_ref) * 1000,
-            patch,
-        )
+    bounds = (data_min, data_max)
+    if data_min <= start_req and data_max >= end_req:
+        return
+
+    LOGGER.info(
+        "backtest ensure_cache: symbol=%s req=[%s,%s] duckdb=[%s,%s] load_ms=%.1f -> incremental_daily_for_symbols",
+        symbol,
+        start_req,
+        end_req,
+        data_min,
+        data_max,
+        load_ms,
+    )
+    t_ref = time.perf_counter()
+    patch = incremental_daily_for_symbols(
+        [symbol],
+        coverage=(start_req, end_req),
+        symbol_bounds={symbol: bounds},
+    )
+    LOGGER.info(
+        "backtest ensure_cache: incremental_daily_for_symbols done refresh_ms=%.1f summary=%s",
+        (time.perf_counter() - t_ref) * 1000,
+        patch,
+    )
 
 
 def run_single_symbol_backtest(
