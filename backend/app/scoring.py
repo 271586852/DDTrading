@@ -91,7 +91,7 @@ def _scale_scores_to_100(frame: pl.DataFrame, score_column: str) -> pl.DataFrame
 
 
 def load_dataset() -> pl.DataFrame:
-    # 评分宽表统一来自 Tushare 驱动的 parquet 组装层。
+    # 评分宽表统一来自 Tushare 驱动的 DuckDB 组装层。
     from app.akshare_loader import load_tushare_dataset
 
     dataset = load_tushare_dataset(universe_size=0)
@@ -161,13 +161,13 @@ def _build_single_symbol_dataset(symbol: str, *, lookback_days: int = 20) -> pl.
     )
     from app.market_data import (
         ensure_symbol_cached,
-        load_tushare_daily,
+        incremental_daily_for_symbols,
         load_pe_snapshot,
         load_stock_names,
-        refresh_market_data,
+        load_tushare_daily,
     )
 
-    # 本地优先；若不足则按策略需求自动补齐（单股补数 -> 增量刷新兜底）。
+    # 本地优先；若不足则单股增量日线再补一次（不写全市场）。
     fetch_days = _required_fetch_days(lookback_days)
     ensure_symbol_cached(symbol, days=fetch_days)
 
@@ -175,7 +175,7 @@ def _build_single_symbol_dataset(symbol: str, *, lookback_days: int = 20) -> pl.
     one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
     min_rows = lookback_days + 1
     if one_daily.height < min_rows:
-        refresh_market_data(mode="incremental", force=True)
+        incremental_daily_for_symbols([symbol])
         daily = load_tushare_daily()
         one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
         if one_daily.height < min_rows:
@@ -290,7 +290,7 @@ def score_stocks(
 
     _report_progress(progress, 1, "准备评分…")
 
-    # 全市场分析：只读本地 parquet；行情更新请单独 POST /refresh。
+    # 全市场分析：只读本地 DuckDB；行情更新请单独 POST /refresh。
     if not target_symbol:
         _report_progress(progress, 8, "使用本地缓存评分（未自动刷新行情）…")
 
