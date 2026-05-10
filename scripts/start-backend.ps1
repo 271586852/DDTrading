@@ -1,7 +1,6 @@
 param(
     [string]$HostAddress = "127.0.0.1",
     [int]$Port = 8011,
-    [Nullable[int]]$TushareUniverseSize = $null,
     [Nullable[int]]$TushareMaxWorkers = $null,
     [string]$TushareToken = "",
     [string]$CorsOrigins = ""
@@ -38,9 +37,6 @@ if (Test-Path $envFile) {
 
 if ($CorsOrigins) {
     $env:DDTRADING_CORS_ORIGINS = $CorsOrigins
-}
-if ($TushareUniverseSize -ne $null) {
-    $env:DDTRADING_TUSHARE_UNIVERSE_SIZE = "$TushareUniverseSize"
 }
 if ($TushareMaxWorkers -ne $null) {
     $env:DDTRADING_TUSHARE_MAX_WORKERS = "$TushareMaxWorkers"

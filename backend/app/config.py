@@ -14,7 +14,6 @@ DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
     "http://localhost:3001",
 )
 DEFAULT_FRONTEND_ORIGIN = DEFAULT_FRONTEND_ORIGINS[0]
-DEFAULT_TUSHARE_UNIVERSE_SIZE = 300
 DEFAULT_TUSHARE_MAX_WORKERS = 4
 # Tushare 常见 500 次/分钟（多为自然分钟口径）；默认略保守，配合 market_data 内最小间隔限流。
 DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE = 420
@@ -44,14 +43,6 @@ def _get_int_env(name: str, default: int, minimum: int = 1) -> int:
     if parsed < minimum:
         raise ValueError(f"{name} must be >= {minimum}.")
     return parsed
-
-
-def get_tushare_universe_size() -> int:
-    return _get_int_env(
-        "DDTRADING_TUSHARE_UNIVERSE_SIZE",
-        default=DEFAULT_TUSHARE_UNIVERSE_SIZE,
-        minimum=20,
-    )
 
 
 def get_tushare_max_workers() -> int:
