@@ -1,6 +1,6 @@
 """单只股票回测封装。
 
-基于 :mod:`akquant` 运行策略；数据取自本地日线 parquet。主要职责：
+基于 SimTradeLab 适配层运行策略；数据取自本地 DuckDB 日线缓存。主要职责：
 
 - 将 ``[start_date, end_date]`` clamp 到可用数据区间。
 - 返回指标、权益曲线、**全量**成交明细（时间倒序）与**全量**每日持仓（升序），
@@ -21,7 +21,8 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from app.market_data import load_tushare_daily, refresh_market_data
+from app import market_repository as repo
+from app.market_data import incremental_daily_for_symbols
 from app.schemas import (
     BacktestDateRange,
     BacktestMetrics,
@@ -38,6 +39,7 @@ from app.trade_strategies import (
     TradeStrategySpec,
     get_trade_strategy,
 )
+from app.simtradelab_runner import run_simtradelab_backtest
 
 
 LOGGER = logging.getLogger(__name__)
@@ -300,7 +302,7 @@ def _report_appendix_html(
     trades: list[dict[str, Any]],
     positions: list[dict[str, Any]],
 ) -> str:
-    """在 akquant 报告 HTML 末尾追加：成交与持仓分页表（纯 JS + JSON）。"""
+    """在回测报告 HTML 末尾追加：成交与持仓分页表（纯 JS + JSON）。"""
     return f"""
 <section id="ddt-report-appendix" style="margin:2rem 1rem 4rem;font-family:system-ui,sans-serif;color:#1e293b;">
   <h2 style="font-size:1.1rem;border-bottom:1px solid #cbd5e1;padding-bottom:.5rem;margin-top:2rem;">成交明细（分页）</h2>
@@ -377,7 +379,7 @@ def _coerce_iso_date(value: Any) -> str | None:
 
 
 def _equity_curve_points(series: Any) -> list[EquityPoint]:
-    """把 akquant 返回的 equity series 转成前端可绘制的 (date, equity, drawdown%)。"""
+    """把 equity series 转成前端可绘制的 (date, equity, drawdown%)。"""
     if series is None or len(series) == 0:
         return []
 
@@ -430,7 +432,7 @@ def _price_series_points(data: pd.DataFrame) -> list[PricePoint]:
 
 
 def _trade_markers(trades_df: pd.DataFrame) -> list[TradeMarker]:
-    """把 akquant trades_df 展开成独立的买/卖点标记。"""
+    """把 trades_df 展开成独立的买/卖点标记。"""
     if trades_df is None or trades_df.empty:
         return []
 
@@ -484,12 +486,11 @@ def _resolve_symbol_window(
     start_req: date,
     end_req: date,
 ) -> tuple[pd.DataFrame, date, date]:
-    """读 parquet → 过滤 symbol → clamp 到数据可用区间 → 返回 pandas 子集。"""
-    daily = load_tushare_daily()
-    sub = daily.filter(pl.col("symbol") == symbol).sort("date")
+    """读 DuckDB → 过滤 symbol → clamp 到数据可用区间 → 返回 pandas 子集。"""
+    sub = repo.load_daily_for_symbol(symbol)
     if sub.height == 0:
         raise KeyError(
-            f"symbol '{symbol}' not found in daily parquet. "
+            f"symbol '{symbol}' not found in daily DuckDB cache. "
             "Ensure /refresh has been called and the symbol is in the universe."
         )
 
@@ -520,43 +521,56 @@ def _resolve_symbol_window(
 
 
 def _ensure_backtest_window_cached(symbol: str, start_req: date, end_req: date) -> None:
-    """本地优先；若区间不完整则先做增量更新再回测。"""
+    """本地优先；若区间不完整则按回测区间向 Tushare 补日线写入 DuckDB 再继续。"""
     t_load = time.perf_counter()
-    daily = load_tushare_daily()
+    sub = repo.load_daily_for_symbol(symbol)
     load_ms = (time.perf_counter() - t_load) * 1000
-    sub = daily.filter(pl.col("symbol") == symbol).sort("date")
     if sub.height == 0:
+        bounds: tuple[date, date] | None = None
         LOGGER.info(
-            "backtest ensure_cache: symbol=%s absent in parquet load_ms=%.1f -> incremental refresh",
+            "backtest ensure_cache: symbol=%s absent in DuckDB load_ms=%.1f -> incremental_daily_for_symbols",
             symbol,
             load_ms,
         )
         t_ref = time.perf_counter()
-        refresh_market_data(mode="incremental", force=True)
+        patch = incremental_daily_for_symbols(
+            [symbol],
+            coverage=(start_req, end_req),
+            symbol_bounds={symbol: bounds},
+        )
         LOGGER.info(
-            "backtest ensure_cache: refresh_market_data done refresh_ms=%.1f",
+            "backtest ensure_cache: incremental_daily_for_symbols done refresh_ms=%.1f summary=%s",
             (time.perf_counter() - t_ref) * 1000,
+            patch,
         )
         return
 
     data_min = _to_date(sub.select(pl.col("date").min()).item())
     data_max = _to_date(sub.select(pl.col("date").max()).item())
-    if data_min > start_req or data_max < end_req:
-        LOGGER.info(
-            "backtest ensure_cache: symbol=%s req=[%s,%s] parquet=[%s,%s] load_ms=%.1f -> incremental refresh",
-            symbol,
-            start_req,
-            end_req,
-            data_min,
-            data_max,
-            load_ms,
-        )
-        t_ref = time.perf_counter()
-        refresh_market_data(mode="incremental", force=True)
-        LOGGER.info(
-            "backtest ensure_cache: refresh_market_data done refresh_ms=%.1f",
-            (time.perf_counter() - t_ref) * 1000,
-        )
+    bounds = (data_min, data_max)
+    if data_min <= start_req and data_max >= end_req:
+        return
+
+    LOGGER.info(
+        "backtest ensure_cache: symbol=%s req=[%s,%s] duckdb=[%s,%s] load_ms=%.1f -> incremental_daily_for_symbols",
+        symbol,
+        start_req,
+        end_req,
+        data_min,
+        data_max,
+        load_ms,
+    )
+    t_ref = time.perf_counter()
+    patch = incremental_daily_for_symbols(
+        [symbol],
+        coverage=(start_req, end_req),
+        symbol_bounds={symbol: bounds},
+    )
+    LOGGER.info(
+        "backtest ensure_cache: incremental_daily_for_symbols done refresh_ms=%.1f summary=%s",
+        (time.perf_counter() - t_ref) * 1000,
+        patch,
+    )
 
 
 def run_single_symbol_backtest(
@@ -565,8 +579,6 @@ def run_single_symbol_backtest(
     commission_rate: float = 0.0003,
 ) -> BacktestResponse:
     """执行一次单只股票回测并打包为 ``BacktestResponse``。"""
-    from akquant import run_backtest
-
     t_total = time.perf_counter()
     symbol = request.symbol.zfill(6)
 
@@ -583,7 +595,6 @@ def run_single_symbol_backtest(
     resolve_ms = (time.perf_counter() - t0) * 1000
 
     spec = _resolve_trade_strategy(request.strategy_id)
-    strategy_cls = spec.build_cls()
     LOGGER.info(
         "running backtest: symbol=%s strategy=%s range=[%s, %s] bars=%d cash=%.2f",
         symbol,
@@ -595,14 +606,14 @@ def run_single_symbol_backtest(
     )
 
     t0 = time.perf_counter()
-    result = run_backtest(
-        strategy=strategy_cls,
+    result = run_simtradelab_backtest(
         data=data,
-        symbols=symbol,
+        symbol=symbol,
+        strategy_id=spec.id,
         initial_cash=request.initial_cash,
         commission_rate=commission_rate,
     )
-    akquant_ms = (time.perf_counter() - t0) * 1000
+    engine_ms = (time.perf_counter() - t0) * 1000
 
     metrics_df = getattr(result, "metrics_df", pd.DataFrame())
     trades_df = getattr(result, "trades_df", pd.DataFrame())
@@ -643,7 +654,7 @@ def run_single_symbol_backtest(
 
     LOGGER.info(
         "backtest timing: symbol=%s strategy=%s bars=%d trades=%d positions=%d "
-        "ensure_ms=%.1f resolve_ms=%.1f akquant_ms=%.1f pack_ms=%.1f total_ms=%.1f",
+        "ensure_ms=%.1f resolve_ms=%.1f simtradelab_ms=%.1f pack_ms=%.1f total_ms=%.1f",
         symbol,
         spec.id,
         len(data),
@@ -651,7 +662,7 @@ def run_single_symbol_backtest(
         len(positions_df),
         ensure_ms,
         resolve_ms,
-        akquant_ms,
+        engine_ms,
         pack_ms,
         total_ms,
     )
@@ -665,8 +676,6 @@ def export_single_symbol_backtest_report(
     commission_rate: float = 0.0003,
 ) -> str:
     """执行回测并导出 HTML 报告内容。"""
-    from akquant import run_backtest
-
     t_total = time.perf_counter()
     symbol = request.symbol.zfill(6)
 
@@ -680,7 +689,6 @@ def export_single_symbol_backtest_report(
     prepare_ms = (time.perf_counter() - t0) * 1000
 
     spec = _resolve_trade_strategy(request.strategy_id)
-    strategy_cls = spec.build_cls()
 
     LOGGER.info(
         "export report: symbol=%s strategy=%s range=[%s, %s] bars=%d cash=%.2f curve_freq=%s",
@@ -694,14 +702,14 @@ def export_single_symbol_backtest_report(
     )
 
     t0 = time.perf_counter()
-    result = run_backtest(
-        strategy=strategy_cls,
+    result = run_simtradelab_backtest(
         data=data,
-        symbols=symbol,
+        symbol=symbol,
+        strategy_id=spec.id,
         initial_cash=request.initial_cash,
         commission_rate=commission_rate,
     )
-    akquant_ms = (time.perf_counter() - t0) * 1000
+    engine_ms = (time.perf_counter() - t0) * 1000
 
     default_title = (
         f"{symbol} {spec.name} 回测报告 "
@@ -735,14 +743,14 @@ def export_single_symbol_backtest_report(
 
     LOGGER.info(
         "backtest report timing: symbol=%s strategy=%s bars=%d trades=%d positions=%d "
-        "prepare_ms=%.1f akquant_ms=%.1f records_ms=%.1f report_html_ms=%.1f total_ms=%.1f",
+        "prepare_ms=%.1f simtradelab_ms=%.1f records_ms=%.1f report_html_ms=%.1f total_ms=%.1f",
         symbol,
         spec.id,
         len(data),
         len(trades_df),
         len(positions_df),
         prepare_ms,
-        akquant_ms,
+        engine_ms,
         records_ms,
         report_html_ms,
         total_ms,

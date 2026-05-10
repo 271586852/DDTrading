@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
+from contextlib import asynccontextmanager
 from typing import List, Literal
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.backtest import export_single_symbol_backtest_report, run_single_symbol_backtest
@@ -27,13 +29,27 @@ from app.strategies import list_strategies
 from app.trade_strategies import list_trade_strategies
 
 
+LOGGER = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    """保证业务 logger 的 INFO 能打到控制台；uvicorn access 对每条请求在「响应结束」才打一行。"""
+    root = logging.getLogger()
+    if root.getEffectiveLevel() > logging.INFO:
+        root.setLevel(logging.INFO)
+    logging.getLogger("app").setLevel(logging.INFO)
+    yield
+
+
 app = FastAPI(
     title="DDTrading Scoring API",
     version="0.2.0",
     description=(
         "Backend API for multi-factor A-share ranking and single-symbol "
-        "backtesting, backed by a local parquet cache built from Tushare."
+        "backtesting, backed by a local DuckDB cache built from Tushare."
     ),
+    lifespan=_lifespan,
 )
 
 app.add_middleware(
@@ -43,6 +59,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# 这些 POST 可能耗时较长；uvicorn access 只在响应返回后打一行，故在此提前打 INFO。
+_LONG_POST_PATHS: frozenset[str] = frozenset({"/refresh", "/backtest", "/backtest/report"})
+
+
+@app.middleware("http")
+async def _log_long_post_start(request: Request, call_next):
+    if request.method == "POST" and request.url.path in _LONG_POST_PATHS:
+        LOGGER.info(
+            "HTTP POST %s 已开始 query=%r（access 的 POST 行要等本请求结束才打印）",
+            request.url.path,
+            request.url.query,
+        )
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -140,7 +171,7 @@ def calculate_scores(payload: ScoreRequest) -> ScoreResponse:
 def get_quote(symbol: str, bars: int = 120) -> QuoteResponse:
     """返回单只标的的最近 ``bars`` 根 K 线 + 最新收盘价 / 涨跌幅。
 
-    数据来源：本地 parquet 缓存（``ashare_daily.parquet`` + ``stock_names.parquet``）。
+    数据来源：本地 DuckDB 缓存（``daily_bars`` + ``stock_names``）。
     若代码不在缓存中，返回 404，提示先调用 ``/refresh``。
     """
     try:
@@ -168,7 +199,7 @@ def get_trade_strategies() -> List[TradeStrategyInfo]:
 
 @app.post("/backtest", response_model=BacktestResponse)
 def run_backtest_endpoint(payload: BacktestRequest) -> BacktestResponse:
-    """单只股票回测（基于本地 parquet 缓存 + akquant）。"""
+    """单只股票回测（基于本地 DuckDB 缓存 + SimTradeLab 适配层）。"""
     try:
         return run_single_symbol_backtest(payload)
     except KeyError as exc:
@@ -210,9 +241,10 @@ def refresh_data(
     """手动刷新全市场日线 + 名称 + PE 快照。
 
     - ``mode=incremental``: 默认增量刷新，日线按已缓存最后日期补拉，PE 按日补齐。
-    - ``mode=full``: 全量重建三张 parquet；首次或全量重建可能耗时 30~60 分钟。
+    - ``mode=full``: 全量重建三张 DuckDB 表；首次或全量重建可能耗时 30~60 分钟。
     - ``force=true``: 跳过「距上次成功刷新不足冷却窗口」的短路（默认冷却见环境变量）。
     """
+    LOGGER.info("POST /refresh: mode=%s force=%s (拉取进行中则见 app.market_data 日志)", mode, force)
     try:
         summary = refresh_market_data(mode=mode, force=force)
         if summary.get("skipped"):

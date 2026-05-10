@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TUSHARE_DAILY_PARQUET_PATH = BACKEND_ROOT / "data" / "tushare_daily.parquet"
+DEFAULT_MARKET_DUCKDB_PATH = BACKEND_ROOT / "data" / "market.duckdb"
 DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
     "http://127.0.0.1:3000",
     "http://localhost:3000",
@@ -13,10 +13,11 @@ DEFAULT_FRONTEND_ORIGINS: tuple[str, ...] = (
     "http://localhost:3001",
 )
 DEFAULT_FRONTEND_ORIGIN = DEFAULT_FRONTEND_ORIGINS[0]
-DEFAULT_TUSHARE_UNIVERSE_SIZE = 300
-DEFAULT_TUSHARE_MAX_WORKERS = 8
-# Tushare 日线等接口常见限额：500 次/分钟；并发拉取时在此上限内排队。
-DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE = 500
+DEFAULT_TUSHARE_MAX_WORKERS = 4
+# Tushare 常见 500 次/分钟（多为自然分钟口径）；默认略保守，配合 market_data 内最小间隔限流。
+DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE = 420
+# 平台文档上限；环境变量不可超过此值（避免误配仍被服务端拒）。
+TUSHARE_PLATFORM_MAX_RPM = 500
 DEFAULT_DAILY_HISTORY_DAYS = 3650
 DEFAULT_DAILY_CACHE_TTL_HOURS = 24
 # POST /refresh 成功完成后，在多少小时内直接跳过重复刷新（0 表示不启用）。
@@ -43,14 +44,6 @@ def _get_int_env(name: str, default: int, minimum: int = 1) -> int:
     return parsed
 
 
-def get_tushare_universe_size() -> int:
-    return _get_int_env(
-        "DDTRADING_TUSHARE_UNIVERSE_SIZE",
-        default=DEFAULT_TUSHARE_UNIVERSE_SIZE,
-        minimum=20,
-    )
-
-
 def get_tushare_max_workers() -> int:
     return _get_int_env(
         "DDTRADING_TUSHARE_MAX_WORKERS",
@@ -66,14 +59,14 @@ def get_tushare_max_requests_per_minute() -> int:
         default=DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE,
         minimum=1,
     )
-    return min(parsed, DEFAULT_TUSHARE_MAX_REQUESTS_PER_MINUTE)
+    return min(parsed, TUSHARE_PLATFORM_MAX_RPM)
 
 
-def get_tushare_daily_parquet_path() -> Path:
-    """Tushare 日线 parquet 的存储路径。"""
-    raw_path = os.getenv("DDTRADING_TUSHARE_DAILY_PARQUET_PATH")
+def get_market_duckdb_path() -> Path:
+    """DuckDB 市场数据文件路径。"""
+    raw_path = os.getenv("DDTRADING_MARKET_DUCKDB_PATH")
     if not raw_path:
-        return DEFAULT_TUSHARE_DAILY_PARQUET_PATH
+        return DEFAULT_MARKET_DUCKDB_PATH
     return Path(raw_path).expanduser().resolve()
 
 
@@ -87,7 +80,7 @@ def get_daily_history_days() -> int:
 
 
 def get_daily_cache_ttl_hours() -> int:
-    """本地日线 parquet 的 TTL（小时）。为 0 表示永不自动刷新，只走 /refresh。"""
+    """本地日线 DuckDB 缓存的 TTL（小时）。为 0 表示永不自动刷新，只走 /refresh。"""
     return _get_int_env(
         "DDTRADING_DAILY_CACHE_TTL_HOURS",
         default=DEFAULT_DAILY_CACHE_TTL_HOURS,

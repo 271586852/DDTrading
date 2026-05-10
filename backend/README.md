@@ -1,6 +1,6 @@
 # Backend
 
-FastAPI + Polars backend for multi-factor stock scoring.
+FastAPI + DuckDB backend for multi-factor stock scoring and single-symbol backtesting.
 
 ## Install
 
@@ -24,7 +24,7 @@ Default config is loaded from `backend/.env` when using the script.
 
 ## Data Source
 
-The backend now uses Tushare as the only online data source.
+The backend uses Tushare as the online data source, DuckDB as the local market data cache, and a SimTradeLab-compatible backtest adapter.
 
 ### Required
 
@@ -35,9 +35,9 @@ TUSHARE_TOKEN=your_tushare_token_here
 ### Tushare options
 
 ```env
-DDTRADING_TUSHARE_UNIVERSE_SIZE=300
-DDTRADING_TUSHARE_MAX_WORKERS=8
-DDTRADING_TUSHARE_DAILY_PARQUET_PATH=./data/tushare_daily.parquet
+DDTRADING_TUSHARE_MAX_REQUESTS_PER_MINUTE=420
+DDTRADING_TUSHARE_MAX_WORKERS=4
+DDTRADING_MARKET_DUCKDB_PATH=./data/market.duckdb
 ```
 
 Create `backend/.env` directly and fill values from the sections above.
@@ -56,6 +56,9 @@ Output file:
 
 - `GET /health`
 - `POST /score`
+- `GET /quote/{symbol}`
+- `POST /refresh`
+- `POST /backtest`
 
 `POST /score` request body:
 

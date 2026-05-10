@@ -141,7 +141,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8011
 ```
 
 - 生产环境建议把 `DDTRADING_CORS_ORIGINS` 设置为真实前端域名
-- 行情与评分数据来自 Tushare 缓存 parquet：配置 `TUSHARE_TOKEN`，按需设置 `DDTRADING_TUSHARE_DAILY_PARQUET_PATH`、`DDTRADING_DAILY_HISTORY_DAYS` 等（见 `backend/.env.example`）
+- 行情与评分数据来自 Tushare，本地缓存在 DuckDB：配置 `TUSHARE_TOKEN`，按需设置 `DDTRADING_MARKET_DUCKDB_PATH`、`DDTRADING_DAILY_HISTORY_DAYS` 等（见 `backend/.env.example`）
 
 ## 常见问题
 

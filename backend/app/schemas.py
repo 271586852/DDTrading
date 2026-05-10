@@ -20,7 +20,7 @@ class ScoreRequest(BaseModel):
 
     另外可选传 ``symbol``：
     - 不传：全市场排行榜（默认 top 50）。
-    - 传：只返回该 symbol 在全市场 z-score 体系下的评分；若不在 parquet
+    - 传：只返回该 symbol 在全市场 z-score 体系下的评分；若不在 DuckDB
       缓存则后端抛 KeyError → 404；若为 ETF（无 PE）则抛 ValueError → 400。
     """
 
@@ -84,7 +84,7 @@ class ScoreResponse(BaseModel):
     )
     market_data_revision: float = Field(
         default=0.0,
-        description="本地全市场数据版本号（刷新标记与日线 parquet mtime 较大者）；客户端据此判断缓存是否仍有效。",
+        description="本地全市场数据版本号；客户端据此判断缓存是否仍有效。",
     )
 
 
@@ -198,7 +198,7 @@ class BacktestResponse(BaseModel):
     symbol: str
     requested_range: BacktestDateRange
     effective_range: BacktestDateRange = Field(
-        description="实际用于回测的区间（已根据可用 parquet 数据 clamp）。"
+        description="实际用于回测的区间（已根据可用 DuckDB 数据 clamp）。"
     )
     initial_cash: float
     metrics: BacktestMetrics

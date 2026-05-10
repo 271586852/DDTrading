@@ -32,3 +32,4 @@ Thumbs.db
 backend/data/baostock_daily.parquet
 backend/.env
 backend/data/tushare_daily.parquet
+backend/data/market.duckdb

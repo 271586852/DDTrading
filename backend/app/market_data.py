@@ -1,20 +1,17 @@
-"""Tushare 数据层（替代 AKShare / BaoStock）。
+"""Tushare 数据层（DuckDB 本地缓存）。
 
 全模块对 ``pro.daily`` / ``stock_basic`` / ``daily_basic`` 等请求统一做
-**每分钟请求数滑动窗口限流**（默认 500 次/分钟，见 ``get_tushare_max_requests_per_minute``），
-多线程拉取时会在限额内自动排队，避免触发 Tushare 频控。
+**滑动窗口 + 最小请求间隔**限流（见 ``get_tushare_max_requests_per_minute``），
+缓解「自然分钟」边界与纯滑动窗口不一致导致的 500 次/分钟超限。
 
-输出三张 parquet：
-- 日线: ``date / open / high / low / close / volume / symbol``
-- 名称: ``symbol / name``
-- PE: ``symbol / pe_ratio``
+输出三张 DuckDB 表：
+- daily_bars: ``date / open / high / low / close / volume / symbol``
+- stock_names: ``symbol / name``
+- pe_snapshot: ``symbol / pe_ratio``
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
-import tempfile
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,8 +30,8 @@ from app.config import (
     get_tushare_max_requests_per_minute,
     get_tushare_max_workers,
     get_tushare_token,
-    get_tushare_daily_parquet_path,
 )
+from app import market_repository as repo
 
 LOGGER = logging.getLogger(__name__)
 
@@ -79,22 +76,33 @@ def _get_pro():
 _TUSHARE_RL_LOCK = Lock()
 _TUSHARE_RL_TIMES: deque[float] = deque()
 _TUSHARE_RL_WINDOW_SEC = 60.0
+# 两次获准发起 Tushare 请求之间的最小间隔（秒），与滑动窗口叠加，压低自然分钟边界上的突发。
+_TUSHARE_LAST_GRANT_MONO = 0.0
 
 
 def _acquire_tushare_request_slot() -> None:
-    """在并发拉取时限制 Tushare 请求频率（默认 500 次/分钟，滑动窗口）。"""
+    """在并发拉取时限制 Tushare 请求频率（滑动窗口 + 最小间隔，避免触发频控）。"""
     limit = get_tushare_max_requests_per_minute()
     window = _TUSHARE_RL_WINDOW_SEC
+    # 间隔按「略低于平台 500/ 分钟」折算，与 limit 取小，避免用户把 limit 设很低时间隔仍过短。
+    spacing_rpm = max(60, int(min(limit, 500) * 0.88))
+    min_gap = 60.0 / spacing_rpm
+    global _TUSHARE_LAST_GRANT_MONO
     while True:
         sleep_for = 0.0
         with _TUSHARE_RL_LOCK:
             now = time.monotonic()
             while _TUSHARE_RL_TIMES and _TUSHARE_RL_TIMES[0] <= now - window:
                 _TUSHARE_RL_TIMES.popleft()
-            if len(_TUSHARE_RL_TIMES) < limit:
+            gap_wait = _TUSHARE_LAST_GRANT_MONO + min_gap - now
+            if len(_TUSHARE_RL_TIMES) >= limit:
+                sleep_for = max(0.0, _TUSHARE_RL_TIMES[0] + window - now + 0.005)
+            if gap_wait > 0:
+                sleep_for = max(sleep_for, gap_wait)
+            if sleep_for <= 0:
                 _TUSHARE_RL_TIMES.append(now)
+                _TUSHARE_LAST_GRANT_MONO = now
                 return
-            sleep_for = _TUSHARE_RL_TIMES[0] + window - now + 0.005
         time.sleep(max(sleep_for, 0.01))
 
 
@@ -177,7 +185,10 @@ def _fetch_tushare_daily(symbol: str, start_date: str, end_date: str) -> pd.Data
         end_date=end_date,
     )
     if raw is None or raw.empty:
-        raise RuntimeError("tushare daily returned empty data")
+        ts = _to_ts_code(symbol)
+        raise RuntimeError(
+            f"tushare daily returned empty data (ts_code={ts}, start={start_date}, end={end_date})"
+        )
     return _normalize(
         raw,
         symbol=symbol,
@@ -231,7 +242,7 @@ def list_universe() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 全市场日线 parquet 缓存
+# 全市场日线 DuckDB 缓存
 # ---------------------------------------------------------------------------
 
 
@@ -241,45 +252,21 @@ _MARKET_REFRESH_MARKER = "market_refresh.json"
 
 
 def _market_refresh_marker_path() -> Path:
-    """与日线 parquet 同目录，记录最近一次全市场刷新成功的时间戳。"""
-    return get_tushare_daily_parquet_path().parent / _MARKET_REFRESH_MARKER
+    """保留旧函数名用于兼容；刷新标记已迁入 DuckDB cache_meta。"""
+    return repo.repository_path().with_name(_MARKET_REFRESH_MARKER)
 
 
 def _read_market_refresh_unix() -> float | None:
-    path = _market_refresh_marker_path()
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        raw = data.get("unix_ts")
-        if raw is None:
-            return None
-        return float(raw)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
+    return repo.read_market_refresh_unix()
 
 
 def _write_market_refresh_unix() -> None:
-    path = _market_refresh_marker_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"unix_ts": time.time()}, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    repo.mark_market_refresh()
 
 
 def get_market_data_cache_revision() -> float:
-    """本地全市场数据版本号，供评分结果与前端缓存失效判断。
-
-    取 ``market_refresh.json`` 中的成功刷新时间与日线 parquet 的 ``mtime`` 较大者；
-    任一方更新则数值变大。
-    """
-    path = get_tushare_daily_parquet_path()
-    m_parquet = path.stat().st_mtime if path.is_file() else 0.0
-    m_refresh = _read_market_refresh_unix()
-    if m_refresh is None:
-        return float(m_parquet)
-    return float(max(m_refresh, m_parquet))
+    """本地全市场数据版本号，供评分结果与前端缓存失效判断。"""
+    return repo.cache_revision()
 
 
 def _within_market_refresh_cooldown() -> tuple[bool, float | None, int]:
@@ -295,32 +282,16 @@ def _within_market_refresh_cooldown() -> tuple[bool, float | None, int]:
     return False, last, hours
 
 
-def _parquet_is_fresh(path: Path, ttl_hours: int) -> bool:
-    if not path.exists():
+def _cache_is_fresh(path: Path, ttl_hours: int) -> bool:
+    if not repo.has_daily_data():
         return False
     if ttl_hours <= 0:
         return True  # 0 表示永不自动刷新
-    age_seconds = time.time() - path.stat().st_mtime
+    db_path = repo.repository_path()
+    if not db_path.exists():
+        return False
+    age_seconds = time.time() - db_path.stat().st_mtime
     return age_seconds < ttl_hours * 3600
-
-
-def _write_parquet_atomic(df: pl.DataFrame, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=target.name + ".", suffix=".tmp", dir=target.parent
-    )
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
-        df.write_parquet(tmp_path)
-        os.replace(tmp_path, target)
-    except Exception:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-        raise
 
 
 def _build_daily_dataset(
@@ -378,20 +349,20 @@ def _build_daily_dataset(
 
 
 def load_tushare_daily(*, refresh: bool = False) -> pl.DataFrame:
-    """读取/重建 Tushare 日线缓存。"""
-    path = get_tushare_daily_parquet_path()
+    """读取/重建 Tushare 日线缓存（DuckDB）。"""
+    path = repo.repository_path()
 
     with _CACHE_LOCK:
-        if not refresh and _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
-            LOGGER.info("loading daily parquet from cache: %s", path)
-            return pl.read_parquet(path)
+        if not refresh and _cache_is_fresh(path, get_daily_cache_ttl_hours()):
+            LOGGER.info("loading daily bars from DuckDB cache: %s", path)
+            return repo.load_daily()
 
-        LOGGER.info("rebuilding daily parquet -> %s", path)
+        LOGGER.info("rebuilding daily DuckDB cache -> %s", path)
         dataset = _build_daily_dataset(
             history_days=get_daily_history_days(),
             max_workers=get_tushare_max_workers(),
         )
-        _write_parquet_atomic(dataset, path)
+        repo.replace_daily(dataset)
         return dataset
 
 # ---------------------------------------------------------------------------
@@ -399,16 +370,12 @@ def load_tushare_daily(*, refresh: bool = False) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def _sibling_parquet(name: str) -> Path:
-    return get_tushare_daily_parquet_path().parent / name
-
-
 def _stock_names_path() -> Path:
-    return _sibling_parquet("stock_names.parquet")
+    return repo.repository_path()
 
 
 def _pe_snapshot_path() -> Path:
-    return _sibling_parquet("pe_snapshot.parquet")
+    return repo.repository_path()
 
 
 def _to_float(value) -> float | None:
@@ -448,14 +415,15 @@ def _fetch_stock_names() -> pd.DataFrame:
 
 def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
     """加载 ``symbol / name`` 快照（股票池 = 股票 + ETF）。"""
-    path = _stock_names_path()
+    path = repo.repository_path()
 
     with _CACHE_LOCK:
-        if not refresh and _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
-            return pl.read_parquet(path)
+        if not refresh and repo.names_row_count() > 0:
+            return repo.load_names()
 
+        LOGGER.info("从 Tushare 拉取股票列表 (stock_basic)，写入 DuckDB: %s", path)
         dataset = pl.from_pandas(_fetch_stock_names())
-        _write_parquet_atomic(dataset, path)
+        repo.replace_names(dataset)
         LOGGER.info("stock_names snapshot rebuilt: %d rows -> %s", dataset.height, path)
         return dataset
 
@@ -537,19 +505,19 @@ def _build_pe_snapshot(
 
 def load_pe_snapshot(*, refresh: bool = False) -> pl.DataFrame:
     """加载 ``symbol / pe_ratio`` 快照（只读本地，不自动联网拉取）。"""
-    path = _pe_snapshot_path()
+    path = repo.repository_path()
 
     with _CACHE_LOCK:
-        if not refresh and _parquet_is_fresh(path, get_daily_cache_ttl_hours()):
-            return pl.read_parquet(path)
+        if not refresh and repo.pe_row_count() > 0:
+            return repo.load_pe()
         try:
             snapshot = _build_pe_snapshot(max_workers=get_tushare_max_workers())
-            _write_parquet_atomic(snapshot, path)
+            repo.replace_pe(snapshot)
             return snapshot
         except Exception as exc:  # noqa: BLE001
-            if path.exists():
+            if repo.pe_row_count() > 0:
                 LOGGER.warning("rebuild pe snapshot failed, reusing stale cache: %s", exc)
-                return pl.read_parquet(path)
+                return repo.load_pe()
             raise
 
 
@@ -570,14 +538,9 @@ def _merge_daily_frames(existing: pl.DataFrame, updates: pl.DataFrame) -> pl.Dat
 
 
 def _update_stock_names_incremental(universe: list[str]) -> tuple[pl.DataFrame, dict[str, object]]:
-    path = _stock_names_path()
-    rows_before = 0
-    if path.exists():
-        existing = pl.read_parquet(path)
-        rows_before = existing.height
-    else:
-        existing = pl.DataFrame(schema={"symbol": pl.Utf8, "name": pl.Utf8})
-
+    path = repo.repository_path()
+    existing = repo.load_names()
+    rows_before = existing.height
     fresh = pl.from_pandas(_fetch_stock_names()).filter(pl.col("symbol").is_in(universe)).sort("symbol")
     merged = (
         pl.concat(
@@ -590,7 +553,7 @@ def _update_stock_names_incremental(universe: list[str]) -> tuple[pl.DataFrame, 
         .unique(subset=["symbol"], keep="last")
         .sort("symbol")
     )
-    _write_parquet_atomic(merged, path)
+    repo.upsert_names(fresh)
     return merged, {
         "rows_before": rows_before,
         "rows_after": merged.height,
@@ -604,15 +567,15 @@ def _build_pe_snapshot_incremental(
     max_workers: int,
     universe: list[str],
 ) -> tuple[pl.DataFrame, dict[str, object]]:
-    path = _pe_snapshot_path()
+    path = repo.repository_path()
     stock_universe = [symbol for symbol in universe if _is_stock_symbol(symbol)]
     if not stock_universe:
         raise RuntimeError("empty stock universe — cannot build incremental pe snapshot")
 
     rows_before = 0
     targets: list[str]
-    if path.exists():
-        existing = pl.read_parquet(path)
+    if repo.pe_row_count() > 0:
+        existing = repo.load_pe()
         rows_before = existing.height
         snapshot_cols = existing.columns
         if "updated_at" in snapshot_cols:
@@ -654,7 +617,7 @@ def _build_pe_snapshot_incremental(
         .unique(subset=["symbol"], keep="last")
         .sort("symbol")
     )
-    _write_parquet_atomic(merged, path)
+    repo.upsert_pe(updates)
     return merged, {
         "rows_before": rows_before,
         "rows_after": merged.height,
@@ -663,83 +626,296 @@ def _build_pe_snapshot_incremental(
     }
 
 
-def _refresh_market_data_incremental() -> dict[str, object]:
-    path = _resolve_parquet_path()
+def _incremental_fetch_daily_bars(
+    symbols: list[str],
+    *,
+    latest_dates: dict[str, datetime],
+    max_workers: int,
+    log_tag: str = "增量日线",
+    coverage: tuple[date, date] | None = None,
+    symbol_bounds: dict[str, tuple[date, date] | None] | None = None,
+) -> tuple[list[pd.DataFrame], list[str], list[str]]:
+    """对给定代码列表并发拉 Tushare 增量日线；不写库。返回 (frames, failed_symbols, refreshed_symbols)。
+
+    ``coverage`` + ``symbol_bounds``：按回测区间补左侧历史或右侧更新（本地已有 last 时不再只拉末段）。
+    """
+    if not symbols:
+        return [], [], []
     history_days = get_daily_history_days()
-    max_workers = get_tushare_max_workers()
-    universe = list_universe()
     end_date = datetime.now()
     fallback_start = end_date - timedelta(days=history_days)
+    fallback_start_date = fallback_start.date()
     end_date_str = end_date.strftime("%Y%m%d")
 
-    with _CACHE_LOCK:
-        existing = pl.read_parquet(path) if path.exists() else pl.DataFrame(schema={
-            "date": pl.Datetime,
-            "open": pl.Float64,
-            "high": pl.Float64,
-            "low": pl.Float64,
-            "close": pl.Float64,
-            "volume": pl.Float64,
-            "symbol": pl.Utf8,
-        })
-
-        rows_before = existing.height
-        latest_dates: dict[str, datetime] = {}
-        if existing.height > 0:
-            latest = existing.group_by("symbol").agg(pl.col("date").max().alias("last_date"))
-            for row in latest.iter_rows(named=True):
-                last_date = row["last_date"]
-                if isinstance(last_date, datetime):
-                    latest_dates[str(row["symbol"])] = last_date
-
+    if coverage is not None:
+        if symbol_bounds is None:
+            raise ValueError("symbol_bounds is required when coverage is set")
+        cov_start, cov_end = coverage
+        end_req_clamped = min(cov_end, end_date.date())
+        fetch_tasks: list[tuple[str, str, str]] = []
+        for symbol in symbols:
+            b = symbol_bounds[symbol]
+            if b is None:
+                start_date_eff = max(fallback_start_date, cov_start)
+                end_date_eff = end_req_clamped
+            else:
+                dmin, dmax = b
+                need_left = dmin > cov_start
+                need_right = dmax < end_req_clamped
+                if not need_left and not need_right:
+                    continue
+                if need_left and need_right:
+                    start_date_eff = max(fallback_start_date, cov_start)
+                    end_date_eff = end_req_clamped
+                elif need_left:
+                    start_date_eff = max(fallback_start_date, cov_start)
+                    end_date_eff = dmin
+                else:
+                    start_date_eff = dmax - timedelta(days=INCREMENTAL_OVERLAP_DAYS)
+                    end_date_eff = end_req_clamped
+            if start_date_eff > end_date_eff:
+                LOGGER.warning(
+                    "%s: skip %s empty fetch window [%s, %s]",
+                    log_tag,
+                    symbol,
+                    start_date_eff,
+                    end_date_eff,
+                )
+                continue
+            fetch_tasks.append(
+                (
+                    symbol,
+                    start_date_eff.strftime("%Y%m%d"),
+                    end_date_eff.strftime("%Y%m%d"),
+                )
+            )
+        total_daily_tasks = len(fetch_tasks)
+        if total_daily_tasks == 0:
+            return [], [], []
+        progress_every = max(1, min(50, total_daily_tasks // 8 or 1))
         frames: list[pd.DataFrame] = []
         failed: list[str] = []
         refreshed_symbols: list[str] = []
-
+        t_fetch = time.monotonic()
+        LOGGER.info(
+            "%s: 按回测区间补日线 任务数=%d workers=%d coverage=[%s,%s] clamped_end=%s",
+            log_tag,
+            total_daily_tasks,
+            max_workers,
+            cov_start,
+            cov_end,
+            end_req_clamped,
+        )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {}
-            for symbol in universe:
-                last_date = latest_dates.get(symbol)
-                if last_date is None:
-                    start_dt = fallback_start
-                else:
-                    start_dt = max(
-                        fallback_start,
-                        last_date - timedelta(days=INCREMENTAL_OVERLAP_DAYS),
-                    )
-                future = executor.submit(
+            future_map = {
+                executor.submit(
                     fetch_daily_one,
-                    symbol,
-                    start_dt.strftime("%Y%m%d"),
-                    end_date_str,
+                    sym,
+                    s_str,
+                    e_str,
                     adjust="qfq",
-                )
-                future_map[future] = symbol
-
+                ): sym
+                for sym, s_str, e_str in fetch_tasks
+            }
+            completed = 0
             for future in as_completed(future_map):
                 symbol = future_map[future]
+                completed += 1
                 try:
                     frame = future.result()
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.warning("incremental daily fetch failed for %s: %s", symbol, exc)
                     failed.append(symbol)
-                    continue
-                if frame.empty:
-                    continue
-                frames.append(frame)
-                refreshed_symbols.append(symbol)
+                else:
+                    if not frame.empty:
+                        frames.append(frame)
+                        refreshed_symbols.append(symbol)
+                if completed % progress_every == 0 or completed == total_daily_tasks:
+                    LOGGER.info(
+                        "%s Tushare 进度: %d/%d (%.0f%%) elapsed=%.1fs",
+                        log_tag,
+                        completed,
+                        total_daily_tasks,
+                        100.0 * completed / total_daily_tasks,
+                        time.monotonic() - t_fetch,
+                    )
+        LOGGER.info(
+            "%s: Tushare 请求阶段结束 ok_rows=%d symbols=%d failed=%d elapsed=%.1fs",
+            log_tag,
+            sum(len(f) for f in frames),
+            len(set(refreshed_symbols)),
+            len(failed),
+            time.monotonic() - t_fetch,
+        )
+        return frames, failed, refreshed_symbols
+
+    total_daily_tasks = len(symbols)
+    progress_every = max(1, min(50, total_daily_tasks // 8 or 1))
+
+    frames: list[pd.DataFrame] = []
+    failed: list[str] = []
+    refreshed_symbols: list[str] = []
+
+    t_fetch = time.monotonic()
+    LOGGER.info(
+        "%s: 开始向 Tushare 拉取日线 (pro.daily)，标的数=%d workers=%d end=%s",
+        log_tag,
+        total_daily_tasks,
+        max_workers,
+        end_date_str,
+    )
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {}
+        for symbol in symbols:
+            last_date = latest_dates.get(symbol)
+            if last_date is None:
+                start_dt = fallback_start
+            else:
+                start_dt = max(
+                    fallback_start,
+                    last_date - timedelta(days=INCREMENTAL_OVERLAP_DAYS),
+                )
+            future = executor.submit(
+                fetch_daily_one,
+                symbol,
+                start_dt.strftime("%Y%m%d"),
+                end_date_str,
+                adjust="qfq",
+            )
+            future_map[future] = symbol
+
+        completed = 0
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            completed += 1
+            try:
+                frame = future.result()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("incremental daily fetch failed for %s: %s", symbol, exc)
+                failed.append(symbol)
+            else:
+                if not frame.empty:
+                    frames.append(frame)
+                    refreshed_symbols.append(symbol)
+            if completed % progress_every == 0 or completed == total_daily_tasks:
+                LOGGER.info(
+                    "%s Tushare 进度: %d/%d (%.0f%%) elapsed=%.1fs",
+                    log_tag,
+                    completed,
+                    total_daily_tasks,
+                    100.0 * completed / total_daily_tasks,
+                    time.monotonic() - t_fetch,
+                )
+
+    LOGGER.info(
+        "%s: Tushare 请求阶段结束 ok_rows=%d symbols=%d failed=%d elapsed=%.1fs",
+        log_tag,
+        sum(len(f) for f in frames),
+        len(set(refreshed_symbols)),
+        len(failed),
+        time.monotonic() - t_fetch,
+    )
+    return frames, failed, refreshed_symbols
+
+
+def incremental_daily_for_symbols(
+    symbols: Iterable[str],
+    *,
+    coverage: tuple[date, date] | None = None,
+    symbol_bounds: dict[str, tuple[date, date] | None] | None = None,
+) -> dict[str, object]:
+    """仅更新指定代码的增量日线并写入 DuckDB；不刷新证券简称与 PE。
+
+    供回测在本地缺数时按需补拉，避免 ``refresh_market_data(incremental)`` 对全市场扫一遍导致极慢。
+
+    ``coverage`` 为 ``(start, end)`` 且提供 ``symbol_bounds`` 时：按该区间向左/向右补历史（仍受
+    ``DDTRADING_DAILY_HISTORY_DAYS`` 限制，过早起始日会被裁到可拉取窗口）。
+    """
+    uniq = list(dict.fromkeys(_normalize_symbol(s) for s in symbols))
+    if not uniq:
+        return {"symbols_requested": 0, "updated_symbols": 0, "failed_symbols": []}
+
+    if coverage is not None:
+        if symbol_bounds is None:
+            raise ValueError("symbol_bounds is required when coverage is set")
+        missing = [s for s in uniq if s not in symbol_bounds]
+        if missing:
+            raise ValueError(f"symbol_bounds missing keys for symbols: {missing}")
+        cov_start, cov_end = coverage
+        today = datetime.now().date()
+        end_clamped = min(cov_end, today)
+        already_full = True
+        for s in uniq:
+            b = symbol_bounds[s]
+            if b is None:
+                already_full = False
+                break
+            dmin, dmax = b
+            if dmin > cov_start or dmax < end_clamped:
+                already_full = False
+                break
+        if already_full:
+            return {
+                "symbols_requested": len(uniq),
+                "updated_symbols": 0,
+                "failed_symbols": [],
+                "skipped": True,
+                "reason": "coverage_already_cached",
+            }
+
+    max_workers = get_tushare_max_workers()
+    with _CACHE_LOCK:
+        latest_dates = repo.get_last_daily_dates()
+        frames, failed, refreshed = _incremental_fetch_daily_bars(
+            uniq,
+            latest_dates=latest_dates,
+            max_workers=max_workers,
+            log_tag="回测补数日线",
+            coverage=coverage,
+            symbol_bounds=symbol_bounds,
+        )
+        if frames:
+            updates = pl.from_pandas(
+                pd.concat(frames, ignore_index=True).sort_values(["symbol", "date"])
+            )
+            repo.upsert_daily(updates)
+    return {
+        "symbols_requested": len(uniq),
+        "updated_symbols": len(set(refreshed)),
+        "failed_symbols": failed,
+    }
+
+
+def _refresh_market_data_incremental() -> dict[str, object]:
+    path = repo.repository_path()
+    max_workers = get_tushare_max_workers()
+    universe = list_universe()
+
+    with _CACHE_LOCK:
+        existing = repo.load_daily()
+        rows_before = existing.height
+        latest_dates = repo.get_last_daily_dates()
+
+        frames, failed, refreshed_symbols = _incremental_fetch_daily_bars(
+            universe,
+            latest_dates=latest_dates,
+            max_workers=max_workers,
+            log_tag="增量刷新",
+        )
 
         if frames:
             updates = pl.from_pandas(
                 pd.concat(frames, ignore_index=True).sort_values(["symbol", "date"])
             )
             daily = _merge_daily_frames(existing, updates)
-            _write_parquet_atomic(daily, path)
+            repo.upsert_daily(updates)
         else:
             daily = existing
 
+        LOGGER.info("增量刷新: 更新证券简称 (名称 upsert)")
         _names, names_summary = _update_stock_names_incremental(universe)
         try:
+            LOGGER.info("增量刷新: 拉取 PE 快照 (daily_basic)")
             _pe, pe_summary = _build_pe_snapshot_incremental(
                 max_workers=max_workers,
                 universe=universe,
@@ -775,15 +951,21 @@ def _refresh_market_data_incremental() -> dict[str, object]:
 def refresh_market_data(*, mode: str = "full", force: bool = False) -> dict[str, object]:
     """刷新市场缓存。
 
-    ``mode='full'``: 全量重建 daily / names / pe 三张 parquet。
+    ``mode='full'``: 全量重建 daily / names / pe 三张 DuckDB 表。
     ``mode='incremental'``: 日线按 symbol 最后日期补拉，名称做 upsert，PE 按日增量。
 
     ``force=True`` 时跳过「距上次成功刷新不足冷却窗口」的短路（供单股/回测补数等内部调用）。
     手动 ``POST /refresh`` 默认受 ``DDTRADING_MARKET_REFRESH_COOLDOWN_HOURS`` 约束（默认 24h）。
     """
+    LOGGER.info("market refresh 开始: mode=%s force=%s", mode, force)
     if not force:
         cooling, last_unix, cd_hours = _within_market_refresh_cooldown()
         if cooling:
+            LOGGER.info(
+                "market refresh 已跳过: 冷却中 cooldown_hours=%s last_refresh_unix=%s",
+                cd_hours,
+                last_unix,
+            )
             return {
                 "skipped": True,
                 "reason": "cooldown",
@@ -798,29 +980,43 @@ def refresh_market_data(*, mode: str = "full", force: bool = False) -> dict[str,
     if mode == "incremental":
         summary = _refresh_market_data_incremental()
         _write_market_refresh_unix()
+        d = summary.get("daily") if isinstance(summary.get("daily"), dict) else {}
+        LOGGER.info(
+            "market refresh 完成: mode=incremental rows_after=%s updated_symbols=%s failed_symbols=%s",
+            d.get("rows_after"),
+            d.get("updated_symbols"),
+            d.get("failed_symbols"),
+        )
         return summary
     if mode != "full":
         raise ValueError("refresh mode must be either 'full' or 'incremental'")
 
+    LOGGER.info("market refresh 全量: 重建日线 (Tushare pro.daily)，耗时可能较长")
     daily = load_tushare_daily(refresh=True)
+    LOGGER.info("market refresh 全量: 日线写入完成 rows=%s", daily.height)
     names = load_stock_names(refresh=True)
     _write_market_refresh_unix()
 
+    LOGGER.info(
+        "market refresh 完成: mode=full daily_rows=%s names_rows=%s",
+        daily.height,
+        names.height,
+    )
     return {
         "mode": "full",
         "daily": {
             "rows": daily.height,
             "symbols": daily.select(pl.col("symbol").n_unique()).item(),
-            "path": str(_resolve_parquet_path()),
+            "path": str(repo.repository_path()),
         },
         "names": {
             "rows": names.height,
-            "path": str(_stock_names_path()),
+            "path": str(repo.repository_path()),
         },
         "pe": {
             "status": "skipped",
             "reason": "auto PE refresh disabled",
-            "path": str(_pe_snapshot_path()),
+            "path": str(repo.repository_path()),
         },
     }
 
@@ -839,21 +1035,11 @@ def _fetch_single_stock_name(symbol: str) -> str | None:
 
 
 def _upsert_daily(new_daily: pl.DataFrame, symbol: str) -> int:
-    path = _resolve_parquet_path()
-    if path.exists():
-        existing = pl.read_parquet(path)
-        merged = pl.concat(
-            [existing.filter(pl.col("symbol") != symbol), new_daily],
-            how="vertical_relaxed",
-        ).sort(["symbol", "date"])
-    else:
-        merged = new_daily.sort(["symbol", "date"])
-    _write_parquet_atomic(merged, path)
-    return new_daily.height
+    del symbol
+    return repo.upsert_daily(new_daily)
 
 
 def _upsert_pe(symbol: str, pe_value: float) -> None:
-    path = _pe_snapshot_path()
     row = pl.DataFrame(
         {
             "symbol": [symbol],
@@ -861,29 +1047,12 @@ def _upsert_pe(symbol: str, pe_value: float) -> None:
             "updated_at": [datetime.now().isoformat(timespec="seconds")],
         }
     )
-    if path.exists():
-        existing = pl.read_parquet(path)
-        merged = pl.concat(
-            [existing.filter(pl.col("symbol") != symbol), row],
-            how="vertical_relaxed",
-        )
-    else:
-        merged = row
-    _write_parquet_atomic(merged, path)
+    repo.upsert_pe(row)
 
 
 def _upsert_name(symbol: str, name: str) -> None:
-    path = _stock_names_path()
     row = pl.DataFrame({"symbol": [symbol], "name": [name]})
-    if path.exists():
-        existing = pl.read_parquet(path)
-        merged = pl.concat(
-            [existing.filter(pl.col("symbol") != symbol), row],
-            how="vertical_relaxed",
-        )
-    else:
-        merged = row
-    _write_parquet_atomic(merged, path)
+    repo.upsert_names(row)
 
 
 def ensure_symbol_cached(
@@ -892,7 +1061,7 @@ def ensure_symbol_cached(
     days: int = 365,
     adjust: str = "qfq",
 ) -> dict[str, object]:
-    """按需把单只股票的 daily / 名称增量写入本地 parquet 缓存。
+    """按需把单只股票的 daily / 名称增量写入本地 DuckDB 缓存。
 
     用于 ``/score`` 单股路径冷命中时按需补齐——不重建全市场，只追加/覆盖这一只。
 
@@ -949,14 +1118,10 @@ def ensure_symbol_cached(
 
 
 def refresh_tushare_daily() -> dict[str, int | str]:
-    """仅刷新日线 parquet（不触发 PE/名称刷新）。"""
+    """仅刷新日线 DuckDB 缓存（不触发 PE/名称刷新）。"""
     dataset = load_tushare_daily(refresh=True)
     return {
         "rows": dataset.height,
         "symbols": dataset.select(pl.col("symbol").n_unique()).item(),
-        "path": str(_resolve_parquet_path()),
+        "path": str(repo.repository_path()),
     }
-
-
-def _resolve_parquet_path() -> Path:
-    return get_tushare_daily_parquet_path()
