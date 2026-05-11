@@ -4,13 +4,17 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, Literal
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.backtest import export_single_symbol_backtest_report, run_single_symbol_backtest
+from app.backtest import (
+    export_single_symbol_backtest_report,
+    list_trade_strategies,
+    run_single_symbol_backtest,
+)
+from app.common.market_data import get_market_data_cache_revision, refresh_market_data
+from app.common.quotes import fetch_quote
 from app.config import get_cors_origins
-from app.market_data import get_market_data_cache_revision, refresh_market_data
-from app.quotes import fetch_quote
 from app.schemas import (
     BacktestRequest,
     BacktestReportRequest,
@@ -23,13 +27,15 @@ from app.schemas import (
     StrategyInfo,
     TradeStrategyInfo,
 )
-from app.score_market_job import complete_job, create_job, fail_job, get_job, update_job
-from app.scoring import score_stocks
-from app.strategies import list_strategies
-from app.trade_strategies import list_trade_strategies
-
-
-LOGGER = logging.getLogger(__name__)
+from app.score import (
+    complete_job,
+    create_job,
+    fail_job,
+    get_job,
+    list_strategies,
+    score_stocks,
+    update_job,
+)
 
 
 @asynccontextmanager
@@ -59,21 +65,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# 这些 POST 可能耗时较长；uvicorn access 只在响应返回后打一行，故在此提前打 INFO。
-_LONG_POST_PATHS: frozenset[str] = frozenset({"/refresh", "/backtest", "/backtest/report"})
-
-
-@app.middleware("http")
-async def _log_long_post_start(request: Request, call_next):
-    if request.method == "POST" and request.url.path in _LONG_POST_PATHS:
-        LOGGER.info(
-            "HTTP POST %s 已开始 query=%r（access 的 POST 行要等本请求结束才打印）",
-            request.url.path,
-            request.url.query,
-        )
-    return await call_next(request)
 
 
 @app.get("/health")
@@ -244,7 +235,6 @@ def refresh_data(
     - ``mode=full``: 全量重建三张 DuckDB 表；首次或全量重建可能耗时 30~60 分钟。
     - ``force=true``: 跳过「距上次成功刷新不足冷却窗口」的短路（默认冷却见环境变量）。
     """
-    LOGGER.info("POST /refresh: mode=%s force=%s (拉取进行中则见 app.market_data 日志)", mode, force)
     try:
         summary = refresh_market_data(mode=mode, force=force)
         if summary.get("skipped"):
