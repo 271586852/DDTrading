@@ -9,10 +9,8 @@
 from __future__ import annotations
 
 import html
-import logging
 import math
 import tempfile
-import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -21,8 +19,8 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from app import market_repository as repo
-from app.market_data import incremental_daily_for_symbols
+from app.common import market_repository as repo
+from app.common.market_data import incremental_daily_for_symbols
 from app.schemas import (
     BacktestDateRange,
     BacktestMetrics,
@@ -34,15 +32,12 @@ from app.schemas import (
     TradeMarker,
     TradeStrategyInfo,
 )
-from app.trade_strategies import (
+from app.backtest.backtest_strategies import (
     DEFAULT_TRADE_STRATEGY_ID,
     TradeStrategySpec,
     get_trade_strategy,
 )
-from app.simtradelab_runner import run_simtradelab_backtest
-
-
-LOGGER = logging.getLogger(__name__)
+from app.backtest.simtradelab_runner import run_simtradelab_backtest
 
 
 def _to_date(value: Any) -> date:
@@ -522,26 +517,13 @@ def _resolve_symbol_window(
 
 def _ensure_backtest_window_cached(symbol: str, start_req: date, end_req: date) -> None:
     """本地优先；若区间不完整则按回测区间向 Tushare 补日线写入 DuckDB 再继续。"""
-    t_load = time.perf_counter()
     sub = repo.load_daily_for_symbol(symbol)
-    load_ms = (time.perf_counter() - t_load) * 1000
     if sub.height == 0:
         bounds: tuple[date, date] | None = None
-        LOGGER.info(
-            "backtest ensure_cache: symbol=%s absent in DuckDB load_ms=%.1f -> incremental_daily_for_symbols",
-            symbol,
-            load_ms,
-        )
-        t_ref = time.perf_counter()
-        patch = incremental_daily_for_symbols(
+        incremental_daily_for_symbols(
             [symbol],
             coverage=(start_req, end_req),
             symbol_bounds={symbol: bounds},
-        )
-        LOGGER.info(
-            "backtest ensure_cache: incremental_daily_for_symbols done refresh_ms=%.1f summary=%s",
-            (time.perf_counter() - t_ref) * 1000,
-            patch,
         )
         return
 
@@ -551,25 +533,10 @@ def _ensure_backtest_window_cached(symbol: str, start_req: date, end_req: date) 
     if data_min <= start_req and data_max >= end_req:
         return
 
-    LOGGER.info(
-        "backtest ensure_cache: symbol=%s req=[%s,%s] duckdb=[%s,%s] load_ms=%.1f -> incremental_daily_for_symbols",
-        symbol,
-        start_req,
-        end_req,
-        data_min,
-        data_max,
-        load_ms,
-    )
-    t_ref = time.perf_counter()
-    patch = incremental_daily_for_symbols(
+    incremental_daily_for_symbols(
         [symbol],
         coverage=(start_req, end_req),
         symbol_bounds={symbol: bounds},
-    )
-    LOGGER.info(
-        "backtest ensure_cache: incremental_daily_for_symbols done refresh_ms=%.1f summary=%s",
-        (time.perf_counter() - t_ref) * 1000,
-        patch,
     )
 
 
@@ -579,33 +546,17 @@ def run_single_symbol_backtest(
     commission_rate: float = 0.0003,
 ) -> BacktestResponse:
     """执行一次单只股票回测并打包为 ``BacktestResponse``。"""
-    t_total = time.perf_counter()
     symbol = request.symbol.zfill(6)
 
-    t0 = time.perf_counter()
     _ensure_backtest_window_cached(symbol, request.start_date, request.end_date)
-    ensure_ms = (time.perf_counter() - t0) * 1000
-
-    t0 = time.perf_counter()
     data, start_eff, end_eff = _resolve_symbol_window(
         symbol=symbol,
         start_req=request.start_date,
         end_req=request.end_date,
     )
-    resolve_ms = (time.perf_counter() - t0) * 1000
 
     spec = _resolve_trade_strategy(request.strategy_id)
-    LOGGER.info(
-        "running backtest: symbol=%s strategy=%s range=[%s, %s] bars=%d cash=%.2f",
-        symbol,
-        spec.id,
-        start_eff,
-        end_eff,
-        len(data),
-        request.initial_cash,
-    )
 
-    t0 = time.perf_counter()
     result = run_simtradelab_backtest(
         data=data,
         symbol=symbol,
@@ -613,14 +564,12 @@ def run_single_symbol_backtest(
         initial_cash=request.initial_cash,
         commission_rate=commission_rate,
     )
-    engine_ms = (time.perf_counter() - t0) * 1000
 
     metrics_df = getattr(result, "metrics_df", pd.DataFrame())
     trades_df = getattr(result, "trades_df", pd.DataFrame())
     positions_df = getattr(result, "positions_df", pd.DataFrame())
     equity_series = getattr(result, "equity_curve", None)
 
-    t0 = time.perf_counter()
     metrics = BacktestMetrics(
         total_return=_metric(metrics_df, "total_return_pct"),
         annualized_return=_metric(metrics_df, "annualized_return"),
@@ -649,23 +598,6 @@ def run_single_symbol_backtest(
         recent_positions=[],
         daily_positions=_positions_records_asc_full(positions_df),
     )
-    pack_ms = (time.perf_counter() - t0) * 1000
-    total_ms = (time.perf_counter() - t_total) * 1000
-
-    LOGGER.info(
-        "backtest timing: symbol=%s strategy=%s bars=%d trades=%d positions=%d "
-        "ensure_ms=%.1f resolve_ms=%.1f simtradelab_ms=%.1f pack_ms=%.1f total_ms=%.1f",
-        symbol,
-        spec.id,
-        len(data),
-        len(trades_df),
-        len(positions_df),
-        ensure_ms,
-        resolve_ms,
-        engine_ms,
-        pack_ms,
-        total_ms,
-    )
 
     return response
 
@@ -676,32 +608,17 @@ def export_single_symbol_backtest_report(
     commission_rate: float = 0.0003,
 ) -> str:
     """执行回测并导出 HTML 报告内容。"""
-    t_total = time.perf_counter()
     symbol = request.symbol.zfill(6)
 
-    t0 = time.perf_counter()
     _ensure_backtest_window_cached(symbol, request.start_date, request.end_date)
     data, start_eff, end_eff = _resolve_symbol_window(
         symbol=symbol,
         start_req=request.start_date,
         end_req=request.end_date,
     )
-    prepare_ms = (time.perf_counter() - t0) * 1000
 
     spec = _resolve_trade_strategy(request.strategy_id)
 
-    LOGGER.info(
-        "export report: symbol=%s strategy=%s range=[%s, %s] bars=%d cash=%.2f curve_freq=%s",
-        symbol,
-        spec.id,
-        start_eff,
-        end_eff,
-        len(data),
-        request.initial_cash,
-        request.curve_freq,
-    )
-
-    t0 = time.perf_counter()
     result = run_simtradelab_backtest(
         data=data,
         symbol=symbol,
@@ -709,7 +626,6 @@ def export_single_symbol_backtest_report(
         initial_cash=request.initial_cash,
         commission_rate=commission_rate,
     )
-    engine_ms = (time.perf_counter() - t0) * 1000
 
     default_title = (
         f"{symbol} {spec.name} 回测报告 "
@@ -718,14 +634,11 @@ def export_single_symbol_backtest_report(
     report_title = request.title or default_title
 
     # 须在 result.report() 之前取明细：部分版本在出图后可能释放/变更底层缓存。
-    t0 = time.perf_counter()
     trades_df = getattr(result, "trades_df", pd.DataFrame())
     positions_df = getattr(result, "positions_df", pd.DataFrame())
     trade_records = _trades_records_desc(trades_df)
     position_records = _positions_records_asc_full(positions_df)
-    records_ms = (time.perf_counter() - t0) * 1000
 
-    t0 = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="ddtrading-report-") as tmpdir:
         out_path = Path(tmpdir) / "backtest_report.html"
         result.report(
@@ -738,22 +651,5 @@ def export_single_symbol_backtest_report(
         html = out_path.read_text(encoding="utf-8")
         appendix = _report_appendix_html(trade_records, position_records)
         merged = _inject_before_body_close(html, appendix)
-    report_html_ms = (time.perf_counter() - t0) * 1000
-    total_ms = (time.perf_counter() - t_total) * 1000
-
-    LOGGER.info(
-        "backtest report timing: symbol=%s strategy=%s bars=%d trades=%d positions=%d "
-        "prepare_ms=%.1f simtradelab_ms=%.1f records_ms=%.1f report_html_ms=%.1f total_ms=%.1f",
-        symbol,
-        spec.id,
-        len(data),
-        len(trades_df),
-        len(positions_df),
-        prepare_ms,
-        engine_ms,
-        records_ms,
-        report_html_ms,
-        total_ms,
-    )
 
     return merged

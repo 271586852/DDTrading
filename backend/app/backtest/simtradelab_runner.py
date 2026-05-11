@@ -13,6 +13,10 @@ from typing import Any
 
 import pandas as pd
 
+from app.backtest.backtest_strategies import get_trade_strategy
+from app.backtest.backtest_strategies.spec import TradeStrategySpec
+from app.backtest.ptrade_runtime import run_ptrade_on_frame
+
 
 def is_simtradelab_installed() -> bool:
     try:
@@ -73,16 +77,17 @@ def run_simtradelab_backtest(
 ) -> SimTradeLabResult:
     """Run a single-symbol backtest and return normalized frames.
 
-    SimTradeLab is a PTrade-compatible engine. The strategy ids in this app are
-    kept stable, so this adapter preserves their behavior and returns the same
-    shape the API already exposes to the frontend.
+    SimTradeLab is a PTrade-compatible engine. Strategies run as real Python
+    modules implementing ``initialize`` / ``handle_data`` (see ``ptrade_runtime``).
+    Strategy ids stay stable; results match the AKQuant-like shapes the API exposes.
     """
     frame = _prepare_data(data, symbol)
+    spec = get_trade_strategy(strategy_id)
     engine = "SimTradeLab" if is_simtradelab_installed() else "SimTradeLab-compatible"
     return _run_single_symbol_loop(
         frame=frame,
         symbol=symbol,
-        strategy_id=strategy_id,
+        spec=spec,
         initial_cash=initial_cash,
         commission_rate=commission_rate,
         engine=engine,
@@ -109,100 +114,18 @@ def _run_single_symbol_loop(
     *,
     frame: pd.DataFrame,
     symbol: str,
-    strategy_id: str,
+    spec: TradeStrategySpec,
     initial_cash: float,
     commission_rate: float,
     engine: str,
 ) -> SimTradeLabResult:
-    cash = float(initial_cash)
-    position = 0.0
-    avg_entry_price: float | None = None
-    avg_entry_time: pd.Timestamp | None = None
-    avg_entry_bar: int | None = None
-    trades: list[dict[str, Any]] = []
-    positions: list[dict[str, Any]] = []
-    equities: list[tuple[pd.Timestamp, float]] = []
-    closes: list[float] = []
-    prev_fast: float | None = None
-    prev_slow: float | None = None
-
-    for idx, row in frame.iterrows():
-        ts = pd.Timestamp(row["date"])
-        close = float(row["close"])
-        closes.append(close)
-        action = _decide_action(
-            strategy_id=strategy_id,
-            idx=idx,
-            close=close,
-            closes=closes,
-            position=position,
-            prev_fast=prev_fast,
-            prev_slow=prev_slow,
-        )
-
-        if strategy_id == "sma_cross" and len(closes) >= 20:
-            fast_now = sum(closes[-5:]) / 5
-            slow_now = sum(closes[-20:]) / 20
-            prev_fast, prev_slow = fast_now, slow_now
-
-        if action == "buy" and position <= 0:
-            qty = 100.0
-            cost = close * qty
-            commission = cost * commission_rate
-            if cash >= cost + commission:
-                cash -= cost + commission
-                position += qty
-                avg_entry_price = close
-                avg_entry_time = ts
-                avg_entry_bar = idx
-        elif action == "sell" and position > 0:
-            qty = position
-            proceeds = close * qty
-            commission = proceeds * commission_rate
-            cash += proceeds - commission
-            entry_price = float(avg_entry_price or close)
-            entry_time = avg_entry_time or ts
-            entry_bar = avg_entry_bar if avg_entry_bar is not None else idx
-            gross_pnl = (close - entry_price) * qty
-            net_pnl = gross_pnl - (entry_price * qty * commission_rate) - commission
-            trades.append(
-                {
-                    "symbol": symbol,
-                    "side": "long",
-                    "entry_time": entry_time,
-                    "exit_time": ts,
-                    "entry_price": entry_price,
-                    "exit_price": close,
-                    "quantity": qty,
-                    "pnl": gross_pnl,
-                    "net_pnl": net_pnl,
-                    "return_pct": (close / entry_price - 1.0) * 100.0 if entry_price else None,
-                    "commission": (entry_price * qty * commission_rate) + commission,
-                    "duration_bars": idx - entry_bar,
-                }
-            )
-            position = 0.0
-            avg_entry_price = None
-            avg_entry_time = None
-            avg_entry_bar = None
-
-        market_value = position * close
-        equity = cash + market_value
-        equities.append((ts, equity))
-        positions.append(
-            {
-                "date": ts,
-                "equity": equity,
-                "market_value": market_value,
-                "cash": cash,
-                "margin": 0.0,
-                "positions": int(position > 0),
-                "net_exposure": market_value,
-                "gross_exposure": abs(market_value),
-                "leverage": abs(market_value) / equity if equity else 0.0,
-                "quantity": position,
-            }
-        )
+    trades, positions, equities = run_ptrade_on_frame(
+        spec=spec,
+        frame=frame,
+        symbol=symbol,
+        initial_cash=initial_cash,
+        commission_rate=commission_rate,
+    )
 
     equity_series = pd.Series(
         [equity for _, equity in equities],
@@ -223,42 +146,6 @@ def _run_single_symbol_loop(
         equity_curve=equity_series,
         engine=engine,
     )
-
-
-def _decide_action(
-    *,
-    strategy_id: str,
-    idx: int,
-    close: float,
-    closes: list[float],
-    position: float,
-    prev_fast: float | None,
-    prev_slow: float | None,
-) -> str | None:
-    del close
-    if strategy_id == "smoke_test":
-        if idx == 0 and position == 0:
-            return "buy"
-        if idx == 1 and position > 0:
-            return "sell"
-        return None
-    if strategy_id == "flip_100":
-        return "buy" if position == 0 else "sell"
-    if strategy_id == "buy_hold":
-        return "buy" if idx == 0 and position == 0 else None
-    if strategy_id == "sma_cross":
-        if len(closes) < 20:
-            return None
-        fast_now = sum(closes[-5:]) / 5
-        slow_now = sum(closes[-20:]) / 20
-        if prev_fast is None or prev_slow is None:
-            return None
-        if prev_fast <= prev_slow and fast_now > slow_now and position == 0:
-            return "buy"
-        if prev_fast >= prev_slow and fast_now < slow_now and position > 0:
-            return "sell"
-        return None
-    raise KeyError(f"Unknown trade strategy '{strategy_id}'.")
 
 
 def _metrics(
