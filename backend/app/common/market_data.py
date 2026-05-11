@@ -31,7 +31,7 @@ from app.config import (
     get_tushare_max_workers,
     get_tushare_token,
 )
-from app import market_repository as repo
+from app.common import market_repository as repo
 
 LOGGER = logging.getLogger(__name__)
 
@@ -309,14 +309,6 @@ def _build_daily_dataset(
     if not tickers:
         raise RuntimeError("empty universe — cannot build daily dataset")
 
-    LOGGER.info(
-        "building daily dataset: %d symbols, %s ~ %s, workers=%d",
-        len(tickers),
-        start_date_str,
-        end_date_str,
-        max_workers,
-    )
-
     frames: list[pd.DataFrame] = []
     failed: list[str] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -337,12 +329,6 @@ def _build_daily_dataset(
     if not frames:
         raise RuntimeError("no symbol fetched successfully")
 
-    LOGGER.info(
-        "daily dataset built: ok=%d, failed=%d",
-        len(frames),
-        len(failed),
-    )
-
     merged = pd.concat(frames, ignore_index=True)
     merged = merged.sort_values(["symbol", "date"]).reset_index(drop=True)
     return pl.from_pandas(merged)
@@ -354,10 +340,8 @@ def load_tushare_daily(*, refresh: bool = False) -> pl.DataFrame:
 
     with _CACHE_LOCK:
         if not refresh and _cache_is_fresh(path, get_daily_cache_ttl_hours()):
-            LOGGER.info("loading daily bars from DuckDB cache: %s", path)
             return repo.load_daily()
 
-        LOGGER.info("rebuilding daily DuckDB cache -> %s", path)
         dataset = _build_daily_dataset(
             history_days=get_daily_history_days(),
             max_workers=get_tushare_max_workers(),
@@ -421,10 +405,8 @@ def load_stock_names(*, refresh: bool = False) -> pl.DataFrame:
         if not refresh and repo.names_row_count() > 0:
             return repo.load_names()
 
-        LOGGER.info("从 Tushare 拉取股票列表 (stock_basic)，写入 DuckDB: %s", path)
         dataset = pl.from_pandas(_fetch_stock_names())
         repo.replace_names(dataset)
-        LOGGER.info("stock_names snapshot rebuilt: %d rows -> %s", dataset.height, path)
         return dataset
 
 
@@ -461,12 +443,6 @@ def _build_pe_snapshot(
     if not tickers:
         raise RuntimeError("empty universe — cannot build pe snapshot")
 
-    LOGGER.info(
-        "building pe snapshot for %d symbols (workers=%d)",
-        len(tickers),
-        max_workers,
-    )
-
     rows: list[dict[str, object]] = []
     failed = 0
     updated_at = datetime.now().isoformat(timespec="seconds")
@@ -495,11 +471,6 @@ def _build_pe_snapshot(
     if not rows:
         raise RuntimeError("no pe rows fetched successfully")
 
-    LOGGER.info(
-        "pe snapshot built: ok=%d, missing/failed=%d",
-        len(rows),
-        len(tickers) - len(rows),
-    )
     return pl.DataFrame(rows)
 
 
@@ -692,20 +663,9 @@ def _incremental_fetch_daily_bars(
         total_daily_tasks = len(fetch_tasks)
         if total_daily_tasks == 0:
             return [], [], []
-        progress_every = max(1, min(50, total_daily_tasks // 8 or 1))
         frames: list[pd.DataFrame] = []
         failed: list[str] = []
         refreshed_symbols: list[str] = []
-        t_fetch = time.monotonic()
-        LOGGER.info(
-            "%s: 按回测区间补日线 任务数=%d workers=%d coverage=[%s,%s] clamped_end=%s",
-            log_tag,
-            total_daily_tasks,
-            max_workers,
-            cov_start,
-            cov_end,
-            end_req_clamped,
-        )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
                 executor.submit(
@@ -717,10 +677,8 @@ def _incremental_fetch_daily_bars(
                 ): sym
                 for sym, s_str, e_str in fetch_tasks
             }
-            completed = 0
             for future in as_completed(future_map):
                 symbol = future_map[future]
-                completed += 1
                 try:
                     frame = future.result()
                 except Exception as exc:  # noqa: BLE001
@@ -730,40 +688,12 @@ def _incremental_fetch_daily_bars(
                     if not frame.empty:
                         frames.append(frame)
                         refreshed_symbols.append(symbol)
-                if completed % progress_every == 0 or completed == total_daily_tasks:
-                    LOGGER.info(
-                        "%s Tushare 进度: %d/%d (%.0f%%) elapsed=%.1fs",
-                        log_tag,
-                        completed,
-                        total_daily_tasks,
-                        100.0 * completed / total_daily_tasks,
-                        time.monotonic() - t_fetch,
-                    )
-        LOGGER.info(
-            "%s: Tushare 请求阶段结束 ok_rows=%d symbols=%d failed=%d elapsed=%.1fs",
-            log_tag,
-            sum(len(f) for f in frames),
-            len(set(refreshed_symbols)),
-            len(failed),
-            time.monotonic() - t_fetch,
-        )
         return frames, failed, refreshed_symbols
-
-    total_daily_tasks = len(symbols)
-    progress_every = max(1, min(50, total_daily_tasks // 8 or 1))
 
     frames: list[pd.DataFrame] = []
     failed: list[str] = []
     refreshed_symbols: list[str] = []
 
-    t_fetch = time.monotonic()
-    LOGGER.info(
-        "%s: 开始向 Tushare 拉取日线 (pro.daily)，标的数=%d workers=%d end=%s",
-        log_tag,
-        total_daily_tasks,
-        max_workers,
-        end_date_str,
-    )
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {}
         for symbol in symbols:
@@ -784,10 +714,8 @@ def _incremental_fetch_daily_bars(
             )
             future_map[future] = symbol
 
-        completed = 0
         for future in as_completed(future_map):
             symbol = future_map[future]
-            completed += 1
             try:
                 frame = future.result()
             except Exception as exc:  # noqa: BLE001
@@ -797,24 +725,7 @@ def _incremental_fetch_daily_bars(
                 if not frame.empty:
                     frames.append(frame)
                     refreshed_symbols.append(symbol)
-            if completed % progress_every == 0 or completed == total_daily_tasks:
-                LOGGER.info(
-                    "%s Tushare 进度: %d/%d (%.0f%%) elapsed=%.1fs",
-                    log_tag,
-                    completed,
-                    total_daily_tasks,
-                    100.0 * completed / total_daily_tasks,
-                    time.monotonic() - t_fetch,
-                )
 
-    LOGGER.info(
-        "%s: Tushare 请求阶段结束 ok_rows=%d symbols=%d failed=%d elapsed=%.1fs",
-        log_tag,
-        sum(len(f) for f in frames),
-        len(set(refreshed_symbols)),
-        len(failed),
-        time.monotonic() - t_fetch,
-    )
     return frames, failed, refreshed_symbols
 
 
@@ -912,10 +823,8 @@ def _refresh_market_data_incremental() -> dict[str, object]:
         else:
             daily = existing
 
-        LOGGER.info("增量刷新: 更新证券简称 (名称 upsert)")
         _names, names_summary = _update_stock_names_incremental(universe)
         try:
-            LOGGER.info("增量刷新: 拉取 PE 快照 (daily_basic)")
             _pe, pe_summary = _build_pe_snapshot_incremental(
                 max_workers=max_workers,
                 universe=universe,
@@ -957,15 +866,9 @@ def refresh_market_data(*, mode: str = "full", force: bool = False) -> dict[str,
     ``force=True`` 时跳过「距上次成功刷新不足冷却窗口」的短路（供单股/回测补数等内部调用）。
     手动 ``POST /refresh`` 默认受 ``DDTRADING_MARKET_REFRESH_COOLDOWN_HOURS`` 约束（默认 24h）。
     """
-    LOGGER.info("market refresh 开始: mode=%s force=%s", mode, force)
     if not force:
         cooling, last_unix, cd_hours = _within_market_refresh_cooldown()
         if cooling:
-            LOGGER.info(
-                "market refresh 已跳过: 冷却中 cooldown_hours=%s last_refresh_unix=%s",
-                cd_hours,
-                last_unix,
-            )
             return {
                 "skipped": True,
                 "reason": "cooldown",
@@ -980,28 +883,14 @@ def refresh_market_data(*, mode: str = "full", force: bool = False) -> dict[str,
     if mode == "incremental":
         summary = _refresh_market_data_incremental()
         _write_market_refresh_unix()
-        d = summary.get("daily") if isinstance(summary.get("daily"), dict) else {}
-        LOGGER.info(
-            "market refresh 完成: mode=incremental rows_after=%s updated_symbols=%s failed_symbols=%s",
-            d.get("rows_after"),
-            d.get("updated_symbols"),
-            d.get("failed_symbols"),
-        )
         return summary
     if mode != "full":
         raise ValueError("refresh mode must be either 'full' or 'incremental'")
 
-    LOGGER.info("market refresh 全量: 重建日线 (Tushare pro.daily)，耗时可能较长")
     daily = load_tushare_daily(refresh=True)
-    LOGGER.info("market refresh 全量: 日线写入完成 rows=%s", daily.height)
     names = load_stock_names(refresh=True)
     _write_market_refresh_unix()
 
-    LOGGER.info(
-        "market refresh 完成: mode=full daily_rows=%s names_rows=%s",
-        daily.height,
-        names.height,
-    )
     return {
         "mode": "full",
         "daily": {
@@ -1095,13 +984,6 @@ def ensure_symbol_cached(
         daily_rows = _upsert_daily(new_daily, code)
         if name:
             _upsert_name(code, name)
-
-    LOGGER.info(
-        "ensure_symbol_cached: %s -> daily=%d rows, name=%r",
-        code,
-        daily_rows,
-        name,
-    )
 
     pe_value = _fetch_pe_one(code)
     if pe_value is not None:

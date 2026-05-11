@@ -1,6 +1,6 @@
 """评分宽表组装层（Tushare + DuckDB 缓存版）。
 
-从 :mod:`app.market_data` 维护的三张 DuckDB 表
+从 :mod:`app.common.market_data` 维护的三张 DuckDB 表
 （``daily_bars`` / ``stock_names`` / ``pe_snapshot``）中读取数据，计算出评分
 所需的因子（``momentum_20d``、``volatility``），并与静态字段（``name``、
 ``pe_ratio``）合并成一张宽表：
@@ -11,15 +11,10 @@
 """
 from __future__ import annotations
 
-import logging
-
 import pandas as pd
 import polars as pl
 
-from app.market_data import load_tushare_daily, load_pe_snapshot, load_stock_names
-
-
-LOGGER = logging.getLogger(__name__)
+from app.common.market_data import load_tushare_daily, load_pe_snapshot, load_stock_names
 
 MOMENTUM_LOOKBACK = 20
 VOLATILITY_LOOKBACK = 20
@@ -168,5 +163,4 @@ def load_tushare_dataset() -> pl.DataFrame:
             "are populated (run POST /refresh first)."
         )
 
-    LOGGER.info("tushare dataset assembled: %d tickers", dataset.height)
     return dataset

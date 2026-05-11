@@ -39,11 +39,7 @@ type MarketScoreCached = {
   cachedAt: number;
   result: Pick<
     ScoreResponse,
-    | "top_50"
-    | "normalized_weights"
-    | "total_universe"
-    | "returned_count"
-    | "mode"
+    "top_50" | "total_universe" | "returned_count" | "mode"
   > & { applied_strategy?: StrategyInfo | null };
 };
 
@@ -90,7 +86,6 @@ function persistMarketScoreCache(strategyId: string, result: ScoreResponse): voi
       cachedAt: Date.now(),
       result: {
         top_50: result.top_50,
-        normalized_weights: result.normalized_weights,
         total_universe: result.total_universe,
         returned_count: result.returned_count,
         mode: result.mode,

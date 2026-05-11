@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +70,8 @@ class StrategyInfo(BaseModel):
 
 
 class ScoreResponse(BaseModel):
-    normalized_weights: Dict[str, float]
+    model_config = ConfigDict(extra="ignore")
+
     total_universe: int
     returned_count: int
     mode: str = Field(

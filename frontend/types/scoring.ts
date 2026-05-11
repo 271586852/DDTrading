@@ -31,7 +31,6 @@ export type StrategyInfo = {
 export type ScoreMode = "market" | "single";
 
 export type ScoreResponse = {
-  normalized_weights: FactorWeights;
   total_universe: number;
   returned_count: number;
   mode: ScoreMode;

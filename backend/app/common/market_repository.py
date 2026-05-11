@@ -1,8 +1,7 @@
-"""DuckDB-backed market data repository.
+"""基于 DuckDB 的本地行情数据仓储。
 
-This module is the persistence boundary for local market data. Tushare remains
-the online source; DuckDB owns cached daily bars, names, PE snapshots and cache
-revision metadata.
+本模块是本地行情数据的持久化边界：联网数据源仍为 Tushare；DuckDB 负责缓存日线、
+证券简称、PE 快照以及缓存版本等元数据。
 """
 from __future__ import annotations
 
@@ -19,7 +18,7 @@ from app.config import get_market_duckdb_path
 
 try:
     import duckdb
-except ImportError:  # pragma: no cover - dependency guard
+except ImportError:  # pragma: no cover  # duckdb 未安装时占位
     duckdb = None  # type: ignore[assignment]
 
 
