@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import math
 from typing import Callable, Dict
-import logging
 
 import polars as pl
 
-from app.market_data import get_market_data_cache_revision
+from app.common.market_data import get_market_data_cache_revision
 from app.schemas import ScoreRequest
-from app.strategies import ScoringStrategy, get_strategy, get_strategy_lookback_days
+from app.score.score_strategies import (
+    ScoringStrategy,
+    get_strategy,
+    get_strategy_lookback_days,
+)
 
 
 FACTOR_COLUMNS = {
@@ -19,7 +22,6 @@ FACTOR_COLUMNS = {
 
 REQUIRED_COLUMNS = ["ticker", "name", "pe_ratio", "momentum_20d", "volatility"]
 
-LOGGER = logging.getLogger(__name__)
 SINGLE_STOCK_ONLY_STRATEGY_ID = "single_stock_only"
 
 ProgressFn = Callable[[int, str], None]
@@ -54,15 +56,6 @@ def _raw_weights(payload: ScoreRequest) -> tuple[Dict[str, float], ScoringStrate
     }, None
 
 
-def normalize_weights(payload: ScoreRequest) -> Dict[str, float]:
-    raw_weights, _ = _raw_weights(payload)
-    total_abs = sum(abs(value) for value in raw_weights.values())
-    return {
-        key: (value / total_abs if total_abs else 0.0)
-        for key, value in raw_weights.items()
-    }
-
-
 def _safe_zscore_expr(column_name: str) -> pl.Expr:
     mean_expr = pl.col(column_name).mean().over(pl.lit(1))
     std_expr = pl.col(column_name).std(ddof=0).over(pl.lit(1))
@@ -92,7 +85,7 @@ def _scale_scores_to_100(frame: pl.DataFrame, score_column: str) -> pl.DataFrame
 
 def load_dataset() -> pl.DataFrame:
     # 评分宽表统一来自 Tushare 驱动的 DuckDB 组装层。
-    from app.akshare_loader import load_tushare_dataset
+    from app.common.akshare_loader import load_tushare_dataset
 
     dataset = load_tushare_dataset()
     return _validate_dataset(dataset, source_name="tushare")
@@ -113,7 +106,7 @@ def _validate_dataset(dataset: pl.DataFrame, source_name: str) -> pl.DataFrame:
 
 def _normalize_ticker_input(symbol: str) -> str:
     """宽容地把 'sh600000' / '600000' / ' 600000 ' 统一成 6 位代码。"""
-    from app.market_data import _normalize_symbol
+    from app.common.market_data import _normalize_symbol
 
     return _normalize_symbol(symbol)
 
@@ -154,12 +147,12 @@ def _rank_dataset(dataset: pl.DataFrame, weights: Dict[str, float]) -> pl.DataFr
 
 
 def _build_single_symbol_dataset(symbol: str, *, lookback_days: int = 20) -> pl.DataFrame:
-    from app.akshare_loader import (
+    from app.common.akshare_loader import (
         MOMENTUM_LOOKBACK,
         VOLATILITY_LOOKBACK,
         compute_latest_factors_from_daily,
     )
-    from app.market_data import (
+    from app.common.market_data import (
         ensure_symbol_cached,
         incremental_daily_for_symbols,
         load_pe_snapshot,
@@ -245,9 +238,6 @@ def _score_single_stock_only(
     total_score = round(100.0 / (1.0 + math.exp(-raw_score)), 2)
 
     return {
-        "normalized_weights": {
-            key: round(value, 4) for key, value in weights.items()
-        },
         "total_universe": 1,
         "returned_count": 1,
         "mode": "single",
@@ -302,7 +292,8 @@ def score_stocks(
             raise ValueError("strategy 'single_stock_only' requires a non-empty symbol.")
         _report_progress(progress, 10, "单股专用策略评分…")
         normalized = _normalize_ticker_input(target_symbol)
-        from app.market_data import _is_etf_symbol
+        from app.common.market_data import _is_etf_symbol
+
         if _is_etf_symbol(normalized):
             raise ValueError(
                 f"Symbol '{normalized}' is an ETF, which is not supported by "
@@ -362,7 +353,7 @@ def score_stocks(
         mode = "single"
         normalized = _normalize_ticker_input(target_symbol)
 
-        from app.market_data import _is_etf_symbol, ensure_symbol_cached
+        from app.common.market_data import _is_etf_symbol, ensure_symbol_cached
 
         if _is_etf_symbol(normalized):
             raise ValueError(
@@ -373,10 +364,6 @@ def score_stocks(
         assert scored is not None
         matched = scored.filter(pl.col("ticker") == normalized)
         if matched.height == 0:
-            LOGGER.info(
-                "symbol %s miss in scoring dataset; trying on-demand cache fill",
-                normalized,
-            )
             _report_progress(progress, 50, "按需补齐单股缓存…")
             try:
                 on_demand_ensured = ensure_symbol_cached(
@@ -417,9 +404,6 @@ def score_stocks(
 
     assert dataset is not None
     result: Dict[str, object] = {
-        "normalized_weights": {
-            key: round(value, 4) for key, value in weights.items()
-        },
         "total_universe": dataset.height,
         "returned_count": len(rows_out),
         "mode": mode,
