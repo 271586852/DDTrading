@@ -11,7 +11,10 @@ from app.backtest.backtest_strategies.spec import TradeStrategySpec
 
 
 class PTradeBarRuntime:
-    """单标的、逐根 bar：注入 ``g`` / ``order`` / ``get_position`` / ``get_history`` 到策略模块。"""
+    """单标的、逐根 bar：注入 ``g`` / ``order`` / ``get_position`` / ``get_history`` 到策略模块。
+
+    ``get_history`` 只按列名返回最近 ``n`` 根单列数据；需要多列时在策略内多次调用后自行拼接。
+    """
 
     __slots__ = (
         "_frame",
@@ -129,7 +132,9 @@ class PTradeBarRuntime:
         return SimpleNamespace(amount=float(self.position))
 
     def get_history(self, n: int, _freq: str, field: str, security: str) -> pd.DataFrame:
-        del _freq, security
+        del _freq
+        if security != self._symbol:
+            return pd.DataFrame({field: []})
         end = self.bar_index + 1
         start = max(0, end - int(n))
         series = self._frame.iloc[start:end][field].reset_index(drop=True)

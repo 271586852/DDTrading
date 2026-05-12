@@ -1,22 +1,30 @@
-"""Backtest / trade strategies (one module per strategy; PTrade-style source)."""
+"""回测 / 交易策略：扫描本子包中带 ``SPEC`` 的模块并注册。"""
 from __future__ import annotations
 
-from app.backtest.backtest_strategies.buy_hold import SPEC as _buy_hold
-from app.backtest.backtest_strategies.flip_100 import SPEC as _flip_100
-from app.backtest.backtest_strategies.smoke_test import SPEC as _smoke_test
-from app.backtest.backtest_strategies.sma_cross import SPEC as _sma_cross
+import importlib
+import pkgutil
+
+import app.backtest.backtest_strategies as _pkg
 from app.backtest.backtest_strategies.spec import TradeStrategySpec
 
-_TRADE_STRATEGIES: tuple[TradeStrategySpec, ...] = (
-    _smoke_test,
-    _flip_100,
-    _sma_cross,
-    _buy_hold,
-)
+_SKIP_MODULES = frozenset({"spec", "__init__"})
 
-_TRADE_STRATEGY_MAP: dict[str, TradeStrategySpec] = {
-    spec.id: spec for spec in _TRADE_STRATEGIES
-}
+
+def _discover_trade_strategies() -> tuple[TradeStrategySpec, ...]:
+    found: list[TradeStrategySpec] = []
+    for info in pkgutil.iter_modules(_pkg.__path__, _pkg.__name__ + "."):
+        short = info.name.rsplit(".", 1)[-1]
+        if short in _SKIP_MODULES:
+            continue
+        mod = importlib.import_module(info.name)
+        spec = getattr(mod, "SPEC", None)
+        if isinstance(spec, TradeStrategySpec):
+            found.append(spec)
+    return tuple(sorted(found, key=lambda x: x.id))
+
+
+_TRADE_STRATEGIES: tuple[TradeStrategySpec, ...] = _discover_trade_strategies()
+_TRADE_STRATEGY_MAP: dict[str, TradeStrategySpec] = {spec.id: spec for spec in _TRADE_STRATEGIES}
 
 DEFAULT_TRADE_STRATEGY_ID = "flip_100"
 
