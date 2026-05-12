@@ -19,6 +19,7 @@ from app.schemas import (
     BacktestRequest,
     BacktestReportRequest,
     BacktestResponse,
+    FactorFieldInfo,
     MarketScoreJobStarted,
     MarketScoreJobStatus,
     QuoteResponse,
@@ -52,8 +53,8 @@ app = FastAPI(
     title="DDTrading Scoring API",
     version="0.2.0",
     description=(
-        "Backend API for multi-factor A-share ranking and single-symbol "
-        "backtesting, backed by a local DuckDB cache built from Tushare."
+        "Backend API for preset strategy-based A-share scoring (full market or "
+        "single symbol) and backtesting, backed by a local DuckDB cache from Tushare."
     ),
     lifespan=_lifespan,
 )
@@ -86,7 +87,17 @@ def get_strategies() -> List[StrategyInfo]:
             id=s.id,
             name=s.name,
             description=s.description,
-            weights=s.weights(),
+            score_engine=s.score_engine,
+            factor_keys=list(s.factor_keys),
+            factor_fields=[
+                FactorFieldInfo(
+                    key=f.key,
+                    label=f.label,
+                    value_format=f.value_format,
+                    zscore_orientation=f.zscore_orientation,
+                )
+                for f in s.factor_fields
+            ],
         )
         for s in list_strategies()
     ]
@@ -139,7 +150,11 @@ def get_market_score_job(job_id: str) -> MarketScoreJobStatus:
     )
 
 
-@app.post("/score", response_model=ScoreResponse)
+@app.post(
+    "/score",
+    response_model=ScoreResponse,
+    response_model_exclude_none=True,
+)
 def calculate_scores(payload: ScoreRequest) -> ScoreResponse:
     try:
         result = score_stocks(payload)

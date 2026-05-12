@@ -1,37 +1,42 @@
-"""Preset scoring strategies (one module per strategy)."""
+"""预设评分策略：扫描本子包中带 ``STRATEGY`` 的模块并注册。"""
 from __future__ import annotations
 
-from app.score.score_strategies.balanced import STRATEGY as _balanced
-from app.score.score_strategies.growth import STRATEGY as _growth
-from app.score.score_strategies.low_volatility import STRATEGY as _low_volatility
-from app.score.score_strategies.momentum import STRATEGY as _momentum
-from app.score.score_strategies.single_stock_only import STRATEGY as _single_stock_only
-from app.score.score_strategies.spec import ScoringStrategy
-from app.score.score_strategies.value import STRATEGY as _value
+import importlib
+import pkgutil
+from typing import Tuple
 
-_STRATEGY_LIST: tuple[ScoringStrategy, ...] = (
-    _balanced,
-    _value,
-    _momentum,
-    _low_volatility,
-    _growth,
-    _single_stock_only,
-)
+import app.score.score_strategies as _pkg
+from app.score.score_strategies.spec import FactorFieldMeta, ScoringStrategy
 
+_SKIP_MODULES = frozenset({"spec", "__init__"})
+
+
+def _discover_strategies() -> tuple[ScoringStrategy, ...]:
+    found: list[ScoringStrategy] = []
+    for info in pkgutil.iter_modules(_pkg.__path__, _pkg.__name__ + "."):
+        short = info.name.rsplit(".", 1)[-1]
+        if short in _SKIP_MODULES:
+            continue
+        mod = importlib.import_module(info.name)
+        s = getattr(mod, "STRATEGY", None)
+        if isinstance(s, ScoringStrategy):
+            found.append(s)
+    return tuple(sorted(found, key=lambda x: x.id))
+
+
+_STRATEGY_LIST: tuple[ScoringStrategy, ...] = _discover_strategies()
 _STRATEGY_MAP: dict[str, ScoringStrategy] = {s.id: s for s in _STRATEGY_LIST}
-
-DEFAULT_STRATEGY_ID = "balanced"
 
 
 def list_strategies() -> list[ScoringStrategy]:
-    """返回所有预设策略（保留注册顺序）。"""
+    """返回所有预设策略（按 ``id`` 排序）。"""
     return list(_STRATEGY_LIST)
 
 
 def get_strategy(strategy_id: str) -> ScoringStrategy:
     """按 id 取策略；id 不存在则抛 ``KeyError``。"""
     try:
-        return _STRATEGY_MAP[strategy_id]
+        return _STRATEGY_MAP[str(strategy_id)]
     except KeyError as exc:
         available = ", ".join(_STRATEGY_MAP.keys())
         raise KeyError(
@@ -46,12 +51,12 @@ def strategy_exists(strategy_id: str) -> bool:
 def get_strategy_lookback_days(strategy_id: str | None) -> int:
     """返回策略建议的历史窗口天数（交易日）。"""
     if not strategy_id:
-        return 20
+        return 120
     return get_strategy(strategy_id).lookback_days
 
 
 __all__ = [
-    "DEFAULT_STRATEGY_ID",
+    "FactorFieldMeta",
     "ScoringStrategy",
     "get_strategy",
     "get_strategy_lookback_days",

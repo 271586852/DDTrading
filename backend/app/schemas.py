@@ -14,41 +14,21 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class ScoreRequest(BaseModel):
     """评分请求体。
 
-    调用方有两种用法：
-    1. 传 ``strategy_id`` 套用预设策略（此时三个 weight 会被该策略覆盖）。
-    2. 不传 ``strategy_id``，直接传三个 weight 手动配比。
-
-    另外可选传 ``symbol``：
-    - 不传：全市场排行榜（默认 top 50）。
-    - 传：只返回该 symbol 在全市场 z-score 体系下的评分；若不在 DuckDB
-      缓存则后端抛 KeyError → 404；若为 ETF（无 PE）则抛 ValueError → 400。
+    必须传 ``strategy_id``（见 GET /score-strategies）；评分逻辑由对应 ``score_engine`` 实现。
+    可选 ``symbol``：
+    - 不传：对本地 DuckDB 全市场日线逐只跑该策略，返回 top 50（或更少）。
+    - 传：只返回该标的的单股评分；会先按需补齐该标的缓存。
     """
 
-    strategy_id: Optional[str] = Field(
-        default=None,
-        description="可选的预设策略 id；若提供，会覆盖下面三个 weight。",
+    strategy_id: str = Field(
+        ...,
+        min_length=1,
+        description="必选预设策略 id（见 GET /score-strategies）；计算逻辑由该策略的 score_engine 决定。",
     )
     symbol: Optional[str] = Field(
         default=None,
-        description="可选的单只代码；提供后只返回该 symbol 的评分（全市场 z-score 口径）。",
+        description="可选单只代码；不传则全市场排行。",
     )
-    pe_weight: float = Field(default=0.3, description="Weight for PE ratio.")
-    momentum_weight: float = Field(default=0.5, description="Weight for 20-day momentum.")
-    volatility_weight: float = Field(default=-0.2, description="Weight for volatility.")
-
-    @model_validator(mode="after")
-    def validate_non_zero_weights(self) -> "ScoreRequest":
-        if self.strategy_id:
-            # 策略模式：权重由策略决定，这里不做非零校验
-            return self
-        total_abs_weight = (
-            abs(self.pe_weight)
-            + abs(self.momentum_weight)
-            + abs(self.volatility_weight)
-        )
-        if total_abs_weight == 0:
-            raise ValueError("At least one factor weight must be non-zero.")
-        return self
 
 
 class RankedStock(BaseModel):
@@ -56,17 +36,42 @@ class RankedStock(BaseModel):
     ticker: str
     name: str
     total_score: float
-    factor_values: Dict[str, float]
-    factor_zscores: Dict[str, float]
+    factor_values: Optional[Dict[str, float]] = Field(
+        default=None,
+        description="分项原始值；由评分策略决定是否返回及包含哪些键。",
+    )
+    factor_zscores: Optional[Dict[str, float]] = Field(
+        default=None,
+        description="分项 z-score 或策略自定义的标准化分；无分项时为空。",
+    )
+
+
+class FactorFieldInfo(BaseModel):
+    """分项展示元数据（与 ``factor_values`` 键对齐，供前端渲染）。"""
+
+    key: str
+    label: str
+    value_format: str = Field(
+        description="数值格式提示，如 decimal_2 / percent_2 / integer 等。",
+    )
+    zscore_orientation: str = Field(
+        description="分位或 z 分解释：higher_better / lower_better / value_as_percentile_0_100 / none。",
+    )
 
 
 class StrategyInfo(BaseModel):
-    """单条预设策略的对外展示结构。"""
+    """单条预设评分策略的对外展示结构。"""
 
     id: str
     name: str
     description: str
-    weights: Dict[str, float]
+    score_engine: str = Field(description="评分算法管线标识，与后端注册表一致。")
+    factor_keys: List[str] = Field(
+        description="分项键列表（与 factor_fields.key 一致，便于兼容旧客户端）。",
+    )
+    factor_fields: List[FactorFieldInfo] = Field(
+        description="分项完整元数据（标签与格式），优先供前端展示。",
+    )
 
 
 class ScoreResponse(BaseModel):

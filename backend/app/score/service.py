@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import math
-from typing import Callable, Dict
+from typing import Any, Callable, Dict, List
 
 import polars as pl
 
@@ -13,18 +12,24 @@ from app.score.score_strategies import (
     get_strategy_lookback_days,
 )
 
-
-FACTOR_COLUMNS = {
-    "pe_weight": "pe_ratio",
-    "momentum_weight": "momentum_20d",
-    "volatility_weight": "volatility",
-}
-
-REQUIRED_COLUMNS = ["ticker", "name", "pe_ratio", "momentum_20d", "volatility"]
-
-SINGLE_STOCK_ONLY_STRATEGY_ID = "single_stock_only"
-
 ProgressFn = Callable[[int, str], None]
+
+
+def _resolve_score_engine(strategy: ScoringStrategy) -> str:
+    """由策略元数据解析评分引擎；未知引擎给出可操作的错误说明。"""
+    eng = (strategy.score_engine or "").strip()
+    if not eng:
+        raise ValueError(
+            f"策略 {strategy.id!r} 未配置 score_engine。"
+            "请在 ScoringStrategy 中设置 score_engine，并在评分服务注册表中登记实现。"
+        )
+    if eng not in _MARKET_RUNNERS or eng not in _SINGLE_RUNNERS:
+        known = sorted(set(_MARKET_RUNNERS) & set(_SINGLE_RUNNERS))
+        raise ValueError(
+            f"策略 {strategy.id!r} 的 score_engine={eng!r} 尚未在评分服务中实现。"
+            f"当前已注册引擎: {', '.join(known)}。"
+        )
+    return eng
 
 
 def _finalize_score_payload(d: Dict[str, object]) -> Dict[str, object]:
@@ -40,225 +45,276 @@ def _report_progress(cb: ProgressFn | None, pct: int, msg: str) -> None:
 
 
 def _required_fetch_days(lookback_days: int) -> int:
-    """把策略窗口(交易日)映射为按需补数的自然日范围。"""
     return max(lookback_days * 3, 120)
 
 
-def _raw_weights(payload: ScoreRequest) -> tuple[Dict[str, float], ScoringStrategy | None]:
-    """按请求解析原始权重；若带 ``strategy_id`` 则用预设覆盖。"""
-    if payload.strategy_id:
-        strategy = get_strategy(payload.strategy_id)
-        return strategy.weights(), strategy
+def _applied_strategy_view(strategy: ScoringStrategy) -> dict[str, object]:
     return {
-        "pe_weight": payload.pe_weight,
-        "momentum_weight": payload.momentum_weight,
-        "volatility_weight": payload.volatility_weight,
-    }, None
-
-
-def _safe_zscore_expr(column_name: str) -> pl.Expr:
-    mean_expr = pl.col(column_name).mean().over(pl.lit(1))
-    std_expr = pl.col(column_name).std(ddof=0).over(pl.lit(1))
-    return (
-        pl.when(std_expr.fill_null(0) == 0)
-        .then(0.0)
-        .otherwise((pl.col(column_name) - mean_expr) / std_expr)
-        .alias(f"{column_name}_zscore")
-    )
-
-
-def _scale_scores_to_100(frame: pl.DataFrame, score_column: str) -> pl.DataFrame:
-    score_min = frame.select(pl.col(score_column).min()).item()
-    score_max = frame.select(pl.col(score_column).max()).item()
-
-    if score_min == score_max:
-        return frame.with_columns(pl.lit(50.0).alias("total_score"))
-
-    return frame.with_columns(
-        (
-            (pl.col(score_column) - score_min)
-            / (score_max - score_min)
-            * 100.0
-        ).round(2).alias("total_score")
-    )
-
-
-def load_dataset() -> pl.DataFrame:
-    # 评分宽表统一来自 Tushare 驱动的 DuckDB 组装层。
-    from app.common.akshare_loader import load_tushare_dataset
-
-    dataset = load_tushare_dataset()
-    return _validate_dataset(dataset, source_name="tushare")
-
-
-def _validate_dataset(dataset: pl.DataFrame, source_name: str) -> pl.DataFrame:
-    missing_columns = [column for column in REQUIRED_COLUMNS if column not in dataset.columns]
-    if missing_columns:
-        raise ValueError(
-            f"{source_name} dataset missing required columns: {', '.join(missing_columns)}"
-        )
-
-    cleaned = dataset.select(REQUIRED_COLUMNS).drop_nulls(subset=REQUIRED_COLUMNS)
-    if cleaned.height == 0:
-        raise ValueError(f"{source_name} dataset has no valid rows after null filtering.")
-    return cleaned
+        "id": strategy.id,
+        "name": strategy.name,
+        "description": strategy.description,
+        "score_engine": strategy.score_engine,
+        "factor_keys": list(strategy.factor_keys),
+        "factor_fields": [
+            {
+                "key": f.key,
+                "label": f.label,
+                "value_format": f.value_format,
+                "zscore_orientation": f.zscore_orientation,
+            }
+            for f in strategy.factor_fields
+        ],
+    }
 
 
 def _normalize_ticker_input(symbol: str) -> str:
-    """宽容地把 'sh600000' / '600000' / ' 600000 ' 统一成 6 位代码。"""
     from app.common.market_data import _normalize_symbol
 
     return _normalize_symbol(symbol)
 
 
-def _row_to_ranked(row: dict) -> dict:
-    return {
-        "rank": int(row["rank"]),
-        "ticker": row["ticker"],
-        "name": row["name"],
-        "total_score": float(row["total_score"]),
-        "factor_values": {
-            "pe_ratio": float(row["pe_ratio"]),
-            "momentum_20d": float(row["momentum_20d"]),
-            "volatility": float(row["volatility"]),
-        },
-        "factor_zscores": {
-            "pe_ratio": float(row["pe_ratio_zscore"]),
-            "momentum_20d": float(row["momentum_20d_zscore"]),
-            "volatility": float(row["volatility_zscore"]),
-        },
-    }
-
-
-def _rank_dataset(dataset: pl.DataFrame, weights: Dict[str, float]) -> pl.DataFrame:
-    """对一张宽表做 zscore → 加权和 → 归一化到 0~100 → 排名。"""
-    scored = dataset.with_columns(
-        [_safe_zscore_expr(column_name) for column_name in FACTOR_COLUMNS.values()]
-    )
-    raw_score_expr = sum(
-        pl.col(f"{column_name}_zscore") * weights[weight_name]
-        for weight_name, column_name in FACTOR_COLUMNS.items()
-    )
-    scored = scored.with_columns(raw_score_expr.alias("raw_score"))
-    scored = _scale_scores_to_100(scored, "raw_score")
-    scored = scored.sort("total_score", descending=True)
-    scored = scored.with_row_index(name="rank", offset=1)
-    return scored
-
-
-def _build_single_symbol_dataset(symbol: str, *, lookback_days: int = 20) -> pl.DataFrame:
-    from app.common.akshare_loader import (
-        MOMENTUM_LOOKBACK,
-        VOLATILITY_LOOKBACK,
-        compute_latest_factors_from_daily,
-    )
-    from app.common.market_data import (
-        ensure_symbol_cached,
-        incremental_daily_for_symbols,
-        load_pe_snapshot,
-        load_stock_names,
-        load_tushare_daily,
-    )
-
-    # 本地优先；若不足则单股增量日线再补一次（不写全市场）。
-    fetch_days = _required_fetch_days(lookback_days)
-    ensure_symbol_cached(symbol, days=fetch_days)
-
-    daily = load_tushare_daily()
-    one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
-    min_rows = lookback_days + 1
-    if one_daily.height < min_rows:
-        incremental_daily_for_symbols([symbol])
-        daily = load_tushare_daily()
-        one_daily = daily.filter(pl.col("symbol") == symbol).sort("date")
-        if one_daily.height < min_rows:
-            raise KeyError(
-                f"Symbol '{symbol}' has insufficient daily bars for single-stock scoring "
-                f"(need >= {min_rows}, got {one_daily.height})."
-            )
-
-    factors = compute_latest_factors_from_daily(
-        one_daily,
-        momentum_lookback=MOMENTUM_LOOKBACK,
-        volatility_lookback=VOLATILITY_LOOKBACK,
-    )
-    if factors is None:
-        raise KeyError(f"Symbol '{symbol}' has incomplete factor data for single-stock scoring.")
-    momentum_20d, volatility = factors
-
-    pe_snapshot = load_pe_snapshot()
-    pe_match = pe_snapshot.filter(pl.col("symbol") == symbol)
-    if pe_match.height == 0:
-        # 单股补数后仍缺 PE，尝试刷新 PE 快照一次。
-        pe_snapshot = load_pe_snapshot(refresh=True)
-        pe_match = pe_snapshot.filter(pl.col("symbol") == symbol)
-        if pe_match.height == 0:
-            raise KeyError(f"Symbol '{symbol}' has no PE data for single-stock scoring.")
-    pe_ratio = pe_match.select(pl.col("pe_ratio").last()).item()
-    if pe_ratio is None:
-        raise KeyError(f"Symbol '{symbol}' has null PE data for single-stock scoring.")
+def _display_name_for_symbol(symbol: str) -> str:
+    from app.common.market_data import load_stock_names
 
     names = load_stock_names()
-    name_match = names.filter(pl.col("symbol") == symbol)
-    name = (
-        name_match.select(pl.col("name").last()).item()
-        if name_match.height > 0
-        else symbol
+    m = names.filter(pl.col("symbol") == symbol)
+    if m.height == 0:
+        return symbol
+    cell = m.select(pl.col("name").last()).item()
+    return str(cell) if cell is not None else symbol
+
+
+def _pattern_score_from_analysis(out: dict) -> tuple[float, Dict[str, float]]:
+    n_sig = int(out["total_signals"])
+    latest = out["latest_signal"]
+    base = 35.0
+    if latest is not None and getattr(latest, "action", "") == "BUY":
+        total_score = min(100.0, base + float(latest.confidence) * 55.0)
+    else:
+        total_score = min(100.0, base + min(n_sig, 12) * 2.2)
+    conf = (
+        float(getattr(latest, "confidence", 0.0) or 0.0)
+        if latest is not None
+        else 0.0
     )
-
-    return pl.DataFrame(
-        {
-            "ticker": [symbol],
-            "name": [str(name or symbol)],
-            "pe_ratio": [float(pe_ratio)],
-            "momentum_20d": [float(momentum_20d)],
-            "volatility": [float(volatility)],
-        }
-    )
+    breakdown = {
+        "pattern_signal_count": float(n_sig),
+        "latest_confidence": conf,
+    }
+    return round(total_score, 2), breakdown
 
 
-def _score_single_stock_only(
-    symbol: str,
-    weights: Dict[str, float],
-    *,
-    lookback_days: int,
+def _score_zettaranc_composite_single(
+    symbol: str, *, lookback_days: int
 ) -> dict[str, object]:
-    dataset = _build_single_symbol_dataset(symbol, lookback_days=lookback_days)
-    row = dataset.to_dicts()[0]
+    from app.common.market_data import _to_ts_code
+    from app.common.market_repository import load_daily_for_symbol
+    from app.contrib.zettaranc.adapter import daily_data_list_from_polars
+    from app.contrib.zettaranc.screener import analyze_screener_stock
 
-    # 单股模式下没有横截面对比，采用稳定单调映射得到可解释的 0~100 分。
-    pe_factor = -math.log1p(max(float(row["pe_ratio"]), 0.0))
-    momentum_factor = float(row["momentum_20d"])
-    volatility_factor = -float(row["volatility"])
-    raw_score = (
-        pe_factor * weights["pe_weight"]
-        + momentum_factor * weights["momentum_weight"]
-        + volatility_factor * weights["volatility_weight"]
-    )
-    total_score = round(100.0 / (1.0 + math.exp(-raw_score)), 2)
-
+    df = load_daily_for_symbol(symbol).sort("date")
+    if df.height < 30:
+        raise ValueError(
+            f"该评分引擎需要至少 30 根日线: '{symbol}'，当前 {df.height} 根。"
+        )
+    need = max(60, lookback_days)
+    tail = df.tail(min(df.height, need))
+    ts = _to_ts_code(symbol)
+    dd = daily_data_list_from_polars(tail, ts_code=ts)
+    stock = analyze_screener_stock(ts, dd, name=_display_name_for_symbol(symbol))
+    breakdown = {
+        "b1_opportunity": float(stock.b1_score),
+        "trend": float(stock.trend_score),
+        "volume_pattern": float(stock.volume_score),
+        "risk": float(stock.risk_score),
+    }
+    row = {
+        "rank": 1,
+        "ticker": symbol,
+        "name": stock.name,
+        "total_score": float(stock.score),
+        "factor_values": breakdown,
+        "factor_zscores": breakdown,
+    }
     return {
         "total_universe": 1,
         "returned_count": 1,
         "mode": "single",
-        "top_50": [
+        "top_50": [row],
+    }
+
+
+def _score_zettaranc_patterns_single(
+    symbol: str, *, lookback_days: int
+) -> dict[str, object]:
+    from app.common.market_data import _to_ts_code
+    from app.common.market_repository import load_daily_for_symbol
+    from app.contrib.zettaranc.adapter import daily_data_list_from_polars
+    from app.contrib.zettaranc.strategies import analyze_with_strategies_from_klines
+
+    df = load_daily_for_symbol(symbol).sort("date")
+    if df.height < 30:
+        raise ValueError(
+            f"该评分引擎需要至少 30 根日线: '{symbol}'，当前 {df.height} 根。"
+        )
+    need = max(60, lookback_days)
+    tail = df.tail(min(df.height, need))
+    ts = _to_ts_code(symbol)
+    dd = daily_data_list_from_polars(tail, ts_code=ts)
+    out = analyze_with_strategies_from_klines(ts, dd)
+    total_score, breakdown = _pattern_score_from_analysis(out)
+    name = _display_name_for_symbol(symbol)
+    row = {
+        "rank": 1,
+        "ticker": symbol,
+        "name": name,
+        "total_score": total_score,
+        "factor_values": breakdown,
+        "factor_zscores": breakdown,
+    }
+    return {
+        "total_universe": 1,
+        "returned_count": 1,
+        "mode": "single",
+        "top_50": [row],
+    }
+
+
+def _name_map_from_repository() -> dict[str, str]:
+    from app.common.market_repository import load_names
+
+    n = load_names()
+    if n.height == 0:
+        return {}
+    syms = n.get_column("symbol").to_list()
+    names = n.get_column("name").to_list()
+    return {str(s): str(nm) if nm is not None else str(s) for s, nm in zip(syms, names)}
+
+
+def _score_market_zettaranc_composite(
+    *,
+    top_n: int,
+    lookback_days: int,
+    progress: ProgressFn | None,
+) -> dict[str, object]:
+    from app.common.market_data import _to_ts_code
+    from app.common.market_repository import load_daily
+    from app.contrib.zettaranc.adapter import daily_data_list_from_polars
+    from app.contrib.zettaranc.screener import analyze_screener_stock
+
+    daily = load_daily()
+    if daily.height == 0:
+        raise ValueError("本地 DuckDB 无日线数据，请先执行行情同步。")
+
+    name_map = _name_map_from_repository()
+    need = max(60, lookback_days)
+    rows: List[dict[str, object]] = []
+    chunks = daily.sort(["symbol", "date"]).partition_by("symbol", as_dict=True)
+    symbols_seq = sorted(chunks.keys(), key=lambda t: str(t[0]) if t else "")
+    total = len(symbols_seq)
+
+    for i, sym_tuple in enumerate(symbols_seq):
+        one = chunks[sym_tuple]
+        sym = str(sym_tuple[0]) if sym_tuple else ""
+        if (i & 0x3F) == 0 and total:
+            pct = 10 + int(85 * i / total)
+            _report_progress(progress, pct, f"四维评分 {i + 1}/{total}…")
+
+        if one.height < 30:
+            continue
+        tail = one.tail(min(one.height, need))
+        ts = _to_ts_code(sym)
+        dd = daily_data_list_from_polars(tail, ts_code=ts)
+        display = name_map.get(sym, sym)
+        stock = analyze_screener_stock(ts, dd, name=display)
+        breakdown = {
+            "b1_opportunity": float(stock.b1_score),
+            "trend": float(stock.trend_score),
+            "volume_pattern": float(stock.volume_score),
+            "risk": float(stock.risk_score),
+        }
+        rows.append(
             {
-                "rank": 1,
-                "ticker": row["ticker"],
-                "name": row["name"],
-                "total_score": total_score,
-                "factor_values": {
-                    "pe_ratio": float(row["pe_ratio"]),
-                    "momentum_20d": float(row["momentum_20d"]),
-                    "volatility": float(row["volatility"]),
-                },
-                "factor_zscores": {
-                    "pe_ratio": pe_factor,
-                    "momentum_20d": momentum_factor,
-                    "volatility": volatility_factor,
-                },
+                "ticker": sym,
+                "name": stock.name,
+                "total_score": float(stock.score),
+                "factor_values": breakdown,
+                "factor_zscores": breakdown,
             }
-        ],
+        )
+
+    rows.sort(key=lambda r: float(r["total_score"]), reverse=True)
+    top = rows[: max(1, top_n)]
+    for idx, r in enumerate(top, start=1):
+        r["rank"] = idx
+
+    _report_progress(progress, 98, "汇总全市场排名…")
+    return {
+        "total_universe": len(rows),
+        "returned_count": len(top),
+        "mode": "market",
+        "top_50": top,
+    }
+
+
+def _score_market_zettaranc_patterns(
+    *,
+    top_n: int,
+    lookback_days: int,
+    progress: ProgressFn | None,
+) -> dict[str, object]:
+    from app.common.market_data import _to_ts_code
+    from app.common.market_repository import load_daily
+    from app.contrib.zettaranc.adapter import daily_data_list_from_polars
+    from app.contrib.zettaranc.strategies import analyze_with_strategies_from_klines
+
+    daily = load_daily()
+    if daily.height == 0:
+        raise ValueError("本地 DuckDB 无日线数据，请先执行行情同步。")
+
+    name_map = _name_map_from_repository()
+    need = max(60, lookback_days)
+    rows: List[dict[str, object]] = []
+    chunks = daily.sort(["symbol", "date"]).partition_by("symbol", as_dict=True)
+    symbols_seq = sorted(chunks.keys(), key=lambda t: str(t[0]) if t else "")
+    total = len(symbols_seq)
+
+    for i, sym_tuple in enumerate(symbols_seq):
+        one = chunks[sym_tuple]
+        sym = str(sym_tuple[0]) if sym_tuple else ""
+        if (i & 0x3F) == 0 and total:
+            pct = 10 + int(85 * i / total)
+            _report_progress(progress, pct, f"战法信号评分 {i + 1}/{total}…")
+
+        if one.height < 30:
+            continue
+        tail = one.tail(min(one.height, need))
+        ts = _to_ts_code(sym)
+        dd = daily_data_list_from_polars(tail, ts_code=ts)
+        out = analyze_with_strategies_from_klines(ts, dd)
+        total_score, breakdown = _pattern_score_from_analysis(out)
+        display = name_map.get(sym, sym)
+        rows.append(
+            {
+                "ticker": sym,
+                "name": display,
+                "total_score": total_score,
+                "factor_values": breakdown,
+                "factor_zscores": breakdown,
+            }
+        )
+
+    rows.sort(key=lambda r: float(r["total_score"]), reverse=True)
+    top = rows[: max(1, top_n)]
+    for idx, r in enumerate(top, start=1):
+        r["rank"] = idx
+
+    _report_progress(progress, 98, "汇总全市场排名…")
+    return {
+        "total_universe": len(rows),
+        "returned_count": len(top),
+        "mode": "market",
+        "top_50": top,
     }
 
 
@@ -268,167 +324,52 @@ def score_stocks(
     *,
     progress: ProgressFn | None = None,
 ) -> Dict[str, object]:
-    raw_weights, applied_strategy = _raw_weights(payload)
-    total_abs = sum(abs(v) for v in raw_weights.values())
-    weights = {
-        key: (value / total_abs if total_abs else 0.0)
-        for key, value in raw_weights.items()
-    }
+    strategy_id = (payload.strategy_id or "").strip()
+    if not strategy_id:
+        raise ValueError("strategy_id 为必选，请从 GET /score-strategies 选择策略。")
+
+    applied_strategy = get_strategy(strategy_id)
+    engine = _resolve_score_engine(applied_strategy)
 
     target_symbol = (payload.symbol or "").strip()
     lookback_days = get_strategy_lookback_days(payload.strategy_id)
 
     _report_progress(progress, 1, "准备评分…")
 
-    # 全市场分析：只读本地 DuckDB；行情更新请单独 POST /refresh。
     if not target_symbol:
-        _report_progress(progress, 8, "使用本地缓存评分（未自动刷新行情）…")
-
-    if (
-        applied_strategy is not None
-        and applied_strategy.id == SINGLE_STOCK_ONLY_STRATEGY_ID
-    ):
-        if not target_symbol:
-            raise ValueError("strategy 'single_stock_only' requires a non-empty symbol.")
-        _report_progress(progress, 10, "单股专用策略评分…")
-        normalized = _normalize_ticker_input(target_symbol)
-        from app.common.market_data import _is_etf_symbol
-
-        if _is_etf_symbol(normalized):
-            raise ValueError(
-                f"Symbol '{normalized}' is an ETF, which is not supported by "
-                "the current scoring pipeline (no PE ratio)."
-            )
-        result = _score_single_stock_only(
-            normalized,
-            weights,
+        _report_progress(progress, 5, "全市场扫描（仅本地 DuckDB）…")
+        result = _MARKET_RUNNERS[engine](
+            top_n=top_n,
             lookback_days=lookback_days,
+            progress=progress,
         )
-        result["applied_strategy"] = {
-            "id": applied_strategy.id,
-            "name": applied_strategy.name,
-            "description": applied_strategy.description,
-            "weights": {
-                key: round(value, 4)
-                for key, value in applied_strategy.weights().items()
-            },
-        }
+        result["applied_strategy"] = _applied_strategy_view(applied_strategy)
         _report_progress(progress, 100, "完成")
         return _finalize_score_payload(result)
 
-    dataset: pl.DataFrame | None = None
-    scored: pl.DataFrame | None = None
-    try:
-        _report_progress(progress, 32, "加载评分数据集…")
-        dataset = load_dataset()
-        _report_progress(progress, 58, "计算横截面排名…")
-        scored = _rank_dataset(dataset, weights)
-        _report_progress(progress, 78, "排名计算完成")
-    except Exception:
-        if target_symbol:
-            _report_progress(progress, 40, "全量数据集不可用，尝试单股口径…")
-            normalized = _normalize_ticker_input(target_symbol)
-            result = _score_single_stock_only(
-                normalized,
-                weights,
-                lookback_days=lookback_days,
-            )
-            if applied_strategy is not None:
-                result["applied_strategy"] = {
-                    "id": applied_strategy.id,
-                    "name": applied_strategy.name,
-                    "description": applied_strategy.description,
-                    "weights": {
-                        key: round(value, 4)
-                        for key, value in applied_strategy.weights().items()
-                    },
-                }
-            _report_progress(progress, 100, "完成")
-            return result
-        raise
+    _report_progress(progress, 8, "单股评分…")
+    normalized = _normalize_ticker_input(target_symbol)
+    from app.common.market_data import ensure_symbol_cached
 
-    mode = "market"
-    on_demand_ensured: dict | None = None
-    if target_symbol:
-        mode = "single"
-        normalized = _normalize_ticker_input(target_symbol)
-
-        from app.common.market_data import _is_etf_symbol, ensure_symbol_cached
-
-        if _is_etf_symbol(normalized):
-            raise ValueError(
-                f"Symbol '{normalized}' is an ETF, which is not supported by "
-                "the current scoring pipeline (no PE ratio)."
-            )
-
-        assert scored is not None
-        matched = scored.filter(pl.col("ticker") == normalized)
-        if matched.height == 0:
-            _report_progress(progress, 50, "按需补齐单股缓存…")
-            try:
-                on_demand_ensured = ensure_symbol_cached(
-                    normalized,
-                    days=_required_fetch_days(lookback_days),
-                )
-            except ValueError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raise KeyError(
-                    f"Symbol '{normalized}' is not cached and on-demand fetch "
-                    f"failed: {exc}"
-                ) from exc
-
-            _report_progress(progress, 68, "重新加载评分数据集…")
-            dataset = load_dataset()
-            _report_progress(progress, 82, "重新计算排名…")
-            scored = _rank_dataset(dataset, weights)
-            matched = scored.filter(pl.col("ticker") == normalized)
-            if matched.height == 0:
-                missing = []
-                if (on_demand_ensured or {}).get("pe_ratio") is None:
-                    missing.append("PE(东财估值分析暂无数据)")
-                if (on_demand_ensured or {}).get("daily_rows", 0) < 21:
-                    missing.append("历史日线不足 21 根")
-                detail = "; ".join(missing) or "资料仍不完整"
-                raise KeyError(
-                    f"Symbol '{normalized}' fetched on demand but scoring still "
-                    f"missing data ({detail})."
-                )
-
-        top_rows = matched.head(1)
-    else:
-        assert scored is not None
-        top_rows = scored.head(top_n)
-
-    rows_out = [_row_to_ranked(row) for row in top_rows.iter_rows(named=True)]
-
-    assert dataset is not None
-    result: Dict[str, object] = {
-        "total_universe": dataset.height,
-        "returned_count": len(rows_out),
-        "mode": mode,
-        "top_50": rows_out,
-    }
-
-    if on_demand_ensured is not None:
-        result["on_demand_cached"] = {
-            "symbol": on_demand_ensured["symbol"],
-            "daily_rows": on_demand_ensured["daily_rows"],
-            "pe_ratio": on_demand_ensured["pe_ratio"],
-            "name": on_demand_ensured["name"],
-        }
-
-    if applied_strategy is not None:
-        result["applied_strategy"] = {
-            "id": applied_strategy.id,
-            "name": applied_strategy.name,
-            "description": applied_strategy.description,
-            "weights": {
-                key: round(value, 4)
-                for key, value in applied_strategy.weights().items()
-            },
-        }
-
-    _report_progress(progress, 98, "汇总结果…")
+    ensure_symbol_cached(
+        normalized,
+        days=_required_fetch_days(lookback_days),
+    )
+    _report_progress(progress, 40, "策略计算…")
+    result = _SINGLE_RUNNERS[engine](
+        normalized,
+        lookback_days=lookback_days,
+    )
+    result["applied_strategy"] = _applied_strategy_view(applied_strategy)
     _report_progress(progress, 100, "完成")
     return _finalize_score_payload(result)
+
+
+_MARKET_RUNNERS: Dict[str, Callable[..., Dict[str, object]]] = {
+    "zettaranc_composite": _score_market_zettaranc_composite,
+    "zettaranc_patterns": _score_market_zettaranc_patterns,
+}
+_SINGLE_RUNNERS: Dict[str, Callable[..., Dict[str, object]]] = {
+    "zettaranc_composite": _score_zettaranc_composite_single,
+    "zettaranc_patterns": _score_zettaranc_patterns_single,
+}

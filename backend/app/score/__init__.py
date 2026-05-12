@@ -10,18 +10,17 @@ from app.score.market_job import (
     update_job,
 )
 from app.score.score_strategies import (
-    DEFAULT_STRATEGY_ID,
+    FactorFieldMeta,
     ScoringStrategy,
     get_strategy,
     get_strategy_lookback_days,
     list_strategies,
     strategy_exists,
 )
-from app.score.service import SINGLE_STOCK_ONLY_STRATEGY_ID, load_dataset, score_stocks
+from app.score.service import score_stocks
 
 __all__ = [
-    "DEFAULT_STRATEGY_ID",
-    "SINGLE_STOCK_ONLY_STRATEGY_ID",
+    "FactorFieldMeta",
     "ScoringStrategy",
     "ScoreMarketJob",
     "complete_job",
@@ -31,7 +30,6 @@ __all__ = [
     "get_strategy",
     "get_strategy_lookback_days",
     "list_strategies",
-    "load_dataset",
     "score_stocks",
     "strategy_exists",
     "update_job",
