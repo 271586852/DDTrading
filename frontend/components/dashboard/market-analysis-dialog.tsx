@@ -3,6 +3,11 @@
 import { Loader2, X } from "lucide-react";
 import { useEffect } from "react";
 
+import {
+  factorKeysInOrder,
+  formatFactorCellDisplay,
+  labelForFactor,
+} from "@/lib/score-factors";
 import { useScoringStore } from "@/store/use-scoring-store";
 import type { RankedStock } from "@/types/scoring";
 
@@ -106,6 +111,12 @@ export function MarketAnalysisDialog() {
 }
 
 function RankingTable({ rows }: { rows: RankedStock[] }) {
+  const selectedStrategyId = useScoringStore((s) => s.selectedStrategyId);
+  const strategies = useScoringStore((s) => s.strategies);
+  const strat = strategies.find((s) => s.id === selectedStrategyId);
+  const metas = strat?.factor_fields;
+  const metaByKey = new Map(metas?.map((f) => [f.key, f]));
+
   if (rows.length === 0) {
     return (
       <div className="px-6 py-10 text-center text-sm text-slate-500">
@@ -113,6 +124,14 @@ function RankingTable({ rows }: { rows: RankedStock[] }) {
       </div>
     );
   }
+
+  const fv0 = rows[0]?.factor_values;
+  const factorKeys =
+    metas?.length && fv0 && typeof fv0 === "object"
+      ? metas
+          .map((f) => f.key)
+          .filter((k) => typeof fv0[k] === "number")
+      : factorKeysInOrder(fv0);
 
   return (
     <table className="w-full table-fixed text-sm">
@@ -122,9 +141,11 @@ function RankingTable({ rows }: { rows: RankedStock[] }) {
           <th className="w-24 px-3 py-3 text-left">代码</th>
           <th className="px-3 py-3 text-left">名称</th>
           <th className="w-28 px-3 py-3 text-right">综合评分</th>
-          <th className="w-24 px-3 py-3 text-right">PE</th>
-          <th className="w-32 px-3 py-3 text-right">Momentum 20d</th>
-          <th className="w-28 px-3 py-3 text-right">Volatility</th>
+          {factorKeys.map((k) => (
+            <th key={k} className="w-28 px-3 py-3 text-right">
+              {labelForFactor(metas, k)}
+            </th>
+          ))}
         </tr>
       </thead>
       <tbody>
@@ -144,22 +165,26 @@ function RankingTable({ rows }: { rows: RankedStock[] }) {
             >
               {row.total_score.toFixed(1)}
             </td>
-            <td className="px-3 py-2.5 text-right tabular-nums text-slate-300">
-              {row.factor_values.pe_ratio.toFixed(2)}
-            </td>
-            <td
-              className={
-                "px-3 py-2.5 text-right tabular-nums " +
-                (row.factor_values.momentum_20d >= 0
-                  ? "text-rose-300"
-                  : "text-emerald-300")
-              }
-            >
-              {(row.factor_values.momentum_20d * 100).toFixed(2)}%
-            </td>
-            <td className="px-3 py-2.5 text-right tabular-nums text-slate-300">
-              {(row.factor_values.volatility * 100).toFixed(2)}%
-            </td>
+            {factorKeys.map((k) => {
+              const raw = row.factor_values?.[k];
+              const momUp = k === "momentum_20d" && typeof raw === "number" && raw >= 0;
+              const momDown = k === "momentum_20d" && typeof raw === "number" && raw < 0;
+              return (
+                <td
+                  key={k}
+                  className={
+                    "px-3 py-2.5 text-right tabular-nums " +
+                    (momUp
+                      ? "text-rose-300"
+                      : momDown
+                        ? "text-emerald-300"
+                        : "text-slate-300")
+                  }
+                >
+                  {formatFactorCellDisplay(metaByKey.get(k), row.factor_values, k)}
+                </td>
+              );
+            })}
           </tr>
         ))}
       </tbody>

@@ -2,7 +2,15 @@
 
 import { AlertTriangle, Clock, Hash, TrendingDown, TrendingUp } from "lucide-react";
 
+import {
+  factorKeysInOrder,
+  formatFactorCellDisplay,
+  labelForFactor,
+  percentileFromMeta,
+  zscoreToPercentile,
+} from "@/lib/score-factors";
 import { useScoringStore } from "@/store/use-scoring-store";
+import type { FactorFieldInfo } from "@/types/scoring";
 
 function formatNumber(value: number | null | undefined, digits = 2): string {
   if (value == null || Number.isNaN(value)) return "--";
@@ -23,12 +31,14 @@ export function AnalysisMainCard() {
   const scoreError = useScoringStore((state) => state.error);
   const isAnalyzing = useScoringStore((state) => state.isAnalyzing);
   const universeSize = useScoringStore((state) => state.scoreUniverseSize);
+  const selectedStrategyId = useScoringStore((state) => state.selectedStrategyId);
+  const strategies = useScoringStore((state) => state.strategies);
+  const strategy = strategies.find((s) => s.id === selectedStrategyId);
 
   const hasData = Boolean(quote || currentSymbol);
   const isUp = (quote?.change_pct ?? 0) > 0;
   const isDown = (quote?.change_pct ?? 0) < 0;
 
-  // A 股涨跌色：涨红跌绿（与国内交易软件一致）
   const priceColor = isUp
     ? "text-rose-300"
     : isDown
@@ -116,7 +126,7 @@ export function AnalysisMainCard() {
               </p>
             ) : analysisMode === "etf-skip" ? (
               <p className="text-sm leading-relaxed text-slate-400">
-                ETF 标的暂不适用多因子评分（缺少 PE 估值因子）。下方的行情与 K 线仍然可用，可用于回测或趋势参考。
+                ETF 暂不适用当前预设评分策略。下方行情与 K 线仍可用于参考或回测。
               </p>
             ) : analysis ? (
               <SingleScoreInsight
@@ -124,6 +134,7 @@ export function AnalysisMainCard() {
                 zscores={analysis.factor_zscores}
                 values={analysis.factor_values}
                 universeSize={universeSize}
+                factorFields={strategy?.factor_fields}
               />
             ) : isAnalyzing ? (
               <p className="text-sm text-slate-500">正在计算评分…</p>
@@ -141,11 +152,12 @@ export function AnalysisMainCard() {
 
 function SingleScoreInsight(props: {
   score: number;
-  zscores: { pe_ratio: number; momentum_20d: number; volatility: number };
-  values: { pe_ratio: number; momentum_20d: number; volatility: number };
+  zscores: Record<string, number> | null | undefined;
+  values: Record<string, number> | null | undefined;
   universeSize: number | null;
+  factorFields: FactorFieldInfo[] | undefined;
 }) {
-  const { score, zscores, values, universeSize } = props;
+  const { score, zscores, values, universeSize, factorFields } = props;
 
   const scoreColor =
     score >= 75
@@ -156,11 +168,14 @@ function SingleScoreInsight(props: {
           ? "text-purple-300"
           : "text-rose-300";
 
-  const pct = (zs: number) => {
-    // 近似把 z-score 映射到百分位（便于直观比较）
-    const p = 0.5 * (1 + erf(zs / Math.SQRT2));
-    return (p * 100).toFixed(0);
-  };
+  const metaByKey = new Map(factorFields?.map((f) => [f.key, f]));
+
+  const keysOrdered =
+    factorFields?.length && values && typeof values === "object"
+      ? factorFields
+          .map((f) => f.key)
+          .filter((k) => typeof values[k] === "number")
+      : factorKeysInOrder(values);
 
   return (
     <div className="flex flex-col gap-4">
@@ -174,30 +189,46 @@ function SingleScoreInsight(props: {
           </span>
         </div>
         <span className="pb-1 text-xs text-slate-500">
-          {universeSize ? `全市场 ${universeSize} 只同口径样本` : "基于全市场 z-score"}
+          {universeSize
+            ? `全市场 ${universeSize} 只（当前策略可评分样本）`
+            : "由当前所选策略独立计算"}
         </span>
       </div>
 
-      <div className="grid grid-cols-3 gap-2">
-        <FactorCell
-          label="PE"
-          value={values.pe_ratio.toFixed(2)}
-          percentile={pct(-zscores.pe_ratio) /* 低 PE 分位高 */}
-          hint="低估值"
-        />
-        <FactorCell
-          label="Momentum 20d"
-          value={`${(values.momentum_20d * 100).toFixed(2)}%`}
-          percentile={pct(zscores.momentum_20d)}
-          hint="近 20 日强势"
-        />
-        <FactorCell
-          label="Volatility"
-          value={`${(values.volatility * 100).toFixed(2)}%`}
-          percentile={pct(-zscores.volatility) /* 低波动分位高 */}
-          hint="低波动"
-        />
-      </div>
+      {keysOrdered.length === 0 ? (
+        <p className="text-sm leading-relaxed text-slate-500">
+          当前策略未返回分项指标，仅展示相对综合分。
+        </p>
+      ) : (
+        <div
+          className={
+            keysOrdered.length >= 3
+              ? "grid grid-cols-3 gap-2"
+              : "grid grid-cols-1 gap-2 sm:grid-cols-2"
+          }
+        >
+          {keysOrdered.map((key) => {
+            const val = values![key];
+            const meta = metaByKey.get(key);
+            const display = formatFactorCellDisplay(meta, values, key);
+            const { percentile, hint } = percentileFromMeta(
+              meta,
+              val,
+              zscores?.[key],
+              zscoreToPercentile,
+            );
+            return (
+              <FactorCell
+                key={key}
+                label={labelForFactor(factorFields, key)}
+                value={display}
+                percentile={percentile}
+                hint={hint}
+              />
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -219,25 +250,10 @@ function FactorCell(props: {
       <span className="tabular-nums text-sm text-slate-100">{props.value}</span>
       <div className="flex items-center justify-between text-[11px] text-slate-500">
         <span>分位</span>
-        <span className="font-mono text-slate-300">{props.percentile}%</span>
+        <span className="font-mono text-slate-300">
+          {props.percentile === "—" ? "—" : `${props.percentile}%`}
+        </span>
       </div>
     </div>
   );
-}
-
-// 误差函数近似，供 z-score -> 百分位可视化使用
-function erf(x: number): number {
-  const a1 = 0.254829592;
-  const a2 = -0.284496736;
-  const a3 = 1.421413741;
-  const a4 = -1.453152027;
-  const a5 = 1.061405429;
-  const p = 0.3275911;
-  const sign = x < 0 ? -1 : 1;
-  const ax = Math.abs(x);
-  const t = 1.0 / (1.0 + p * ax);
-  const y =
-    1.0 -
-    ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax);
-  return sign * y;
 }

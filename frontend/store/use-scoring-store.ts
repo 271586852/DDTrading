@@ -273,13 +273,18 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
   loadStrategies: async () => {
     try {
       const strategies = await listScoreStrategies();
-      set((state) => ({
-        ...state,
-        strategies,
-        strategiesError: null,
-        selectedStrategyId:
-          state.selectedStrategyId ?? strategies[0]?.id ?? null,
-      }));
+      set((state) => {
+        const ids = new Set(strategies.map((s) => s.id));
+        const prev = state.selectedStrategyId;
+        const next =
+          prev && ids.has(prev) ? prev : null;
+        return {
+          ...state,
+          strategies,
+          strategiesError: null,
+          selectedStrategyId: next,
+        };
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : "加载策略失败";
       set((state) => ({ ...state, strategiesError: message }));
@@ -383,7 +388,7 @@ export const useScoringStore = create<ScoringStore>((set, get) => ({
             // ETF detected server-side → degrade to etf-skip
             analysisMode = "etf-skip";
           } else if (err instanceof ApiError && err.status === 404) {
-            scoreError = `代码 ${normalized} 的评分因子仍不完整（后端已按需补单股），可能缺少 PE 或历史日线不足。`;
+            scoreError = `代码 ${normalized} 评分失败（可能本地日线不足 30 根或缓存未就绪）。`;
           } else {
             scoreError = err instanceof Error ? err.message : "评分失败";
           }
