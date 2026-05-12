@@ -1,11 +1,14 @@
 """评分宽表组装层（Tushare + DuckDB 缓存版）。
 
-从 :mod:`app.common.market_data` 维护的三张 DuckDB 表
-（``daily_bars`` / ``stock_names`` / ``pe_snapshot``）中读取数据，计算出评分
-所需的因子（``momentum_20d``、``volatility``），并与静态字段（``name``、
-``pe_ratio``）合并成一张宽表：
+从 :mod:`app.common.market_data` 维护的 DuckDB 表读取日线，计算
+``momentum_20d``、``volatility``；可选地与 ``pe_snapshot`` 合并得到
+``pe_ratio``。默认输出列：
 
     ticker / name / pe_ratio / momentum_20d / volatility
+
+当 ``load_tushare_dataset(required_factor_columns=...)`` 不包含 ``pe_ratio``
+时，仅输出 ``ticker`` / ``name`` / ``momentum_20d`` / ``volatility``（样本为
+有 K 线即参评，不再要求 PE 快照命中）。
 
 该模块不直接联网；数据刷新通过 ``/refresh`` 入口驱动。
 """
@@ -128,33 +131,74 @@ def _compute_factors(daily: pl.DataFrame) -> pl.DataFrame:
 def _assemble(
     factors: pl.DataFrame,
     names: pl.DataFrame,
-    pe: pl.DataFrame,
+    pe: pl.DataFrame | None,
+    *,
+    include_pe: bool,
 ) -> pl.DataFrame:
-    return (
-        factors.join(pe, on="symbol", how="inner")
-        .join(names, on="symbol", how="left")
+    base = (
+        factors.join(names, on="symbol", how="left")
         .with_columns(pl.col("name").fill_null(pl.col("symbol")))
-        .rename({"symbol": "ticker"})
-        .select(["ticker", "name", "pe_ratio", "momentum_20d", "volatility"])
-        .drop_nulls()
     )
+    if include_pe:
+        if pe is None:
+            raise ValueError("include_pe=True requires a non-null pe snapshot frame.")
+        out = (
+            base.join(pe, on="symbol", how="inner")
+            .rename({"symbol": "ticker"})
+            .select(["ticker", "name", "pe_ratio", "momentum_20d", "volatility"])
+        )
+        return out.drop_nulls()
+
+    out = (
+        base.rename({"symbol": "ticker"})
+        .select(["ticker", "name", "momentum_20d", "volatility"])
+    )
+    return out.drop_nulls()
 
 
-def load_tushare_dataset() -> pl.DataFrame:
+_DEFAULT_SCORE_FACTORS: frozenset[str] = frozenset(
+    {"pe_ratio", "momentum_20d", "volatility"}
+)
+
+
+def load_tushare_dataset(
+    *,
+    required_factor_columns: frozenset[str] | None = None,
+) -> pl.DataFrame:
     """组装评分宽表（优先读 DuckDB 缓存）。
+
+    ``required_factor_columns`` 为 ``None`` 时与旧版一致：内连接 PE，三因子齐全。
+    若不包含 ``pe_ratio``，则仅依赖日线因子 + 名称，样本为「有 K 线即参评」。
 
     若对应本地缓存不存在或已过期，会联网重建；期望常规情况下由
     ``/refresh`` 端点提前触发。
     """
+    cols = required_factor_columns or _DEFAULT_SCORE_FACTORS
+    unknown = cols - _DEFAULT_SCORE_FACTORS
+    if unknown:
+        raise ValueError(
+            f"required_factor_columns must be a subset of {_DEFAULT_SCORE_FACTORS!r}, "
+            f"got extra: {sorted(unknown)}"
+        )
+    if not cols:
+        raise ValueError("required_factor_columns cannot be empty.")
+    if not {"momentum_20d", "volatility"}.issubset(cols):
+        raise ValueError(
+            "required_factor_columns must include 'momentum_20d' and 'volatility' "
+            "(both are produced from the daily close pipeline)."
+        )
+
+    include_pe = "pe_ratio" in cols
     daily = load_tushare_daily()
     names = load_stock_names()
-    pe_snapshot = load_pe_snapshot()
+    pe_snapshot = load_pe_snapshot() if include_pe else None
 
     factors = _compute_factors(daily)
     dataset = _assemble(
         factors=factors,
         names=names,
         pe=pe_snapshot,
+        include_pe=include_pe,
     )
 
     if dataset.height == 0:

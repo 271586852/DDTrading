@@ -60,12 +60,13 @@ Output file:
 - `POST /refresh`
 - `POST /backtest`
 
-`POST /score` request body:
+`POST /score` request body（`strategy_id` 必选，见 `GET /score-strategies`）:
 
 ```json
 {
-  "pe_weight": 0.3,
-  "momentum_weight": 0.5,
-  "volatility_weight": -0.2
+  "strategy_id": "zettaranc_composite",
+  "symbol": "600000"
 }
 ```
+
+不传 `symbol` 时对本地 DuckDB 全市场按所选策略引擎评分并返回排行榜。
