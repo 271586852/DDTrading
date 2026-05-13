@@ -8,7 +8,13 @@ from typing import Tuple
 import app.score.score_strategies as _pkg
 from app.score.score_strategies.spec import FactorFieldMeta, ScoringStrategy
 
-_SKIP_MODULES = frozenset({"spec", "__init__"})
+_SKIP_MODULES = frozenset(
+    {
+        "spec",
+        "__init__",
+        "zettaranc_screener",
+    }
+)
 
 
 def _discover_strategies() -> tuple[ScoringStrategy, ...]:

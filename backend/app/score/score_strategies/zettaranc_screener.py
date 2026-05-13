@@ -1,17 +1,97 @@
 """选股与择时（DuckDB / Polars 日线链路；无 SQLite）。
 
-使用 ``analyze_screener_stock(ts_code, daily_klines, name=...)``，
-``daily_klines`` 由 :mod:`app.contrib.zettaranc.adapter` 提供。
+使用 ``daily_data_list_from_polars`` 将 Polars 日线转为 ``List[DailyData]``，
+再调用 ``analyze_screener_stock(ts_code, daily_klines, name=...)``。
 """
 
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional, Tuple
+
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from app.contrib.zettaranc.adapter import bar_dict_rows_from_daily_data
-from app.common.indicators import DailyData
+import polars as pl
+
+from app.common.indicators import DailyData, bar_dict_rows_from_daily_data
+from app.common.market_data import _to_ts_code
+
+
+def _trade_date_str(v: Any) -> str:
+    if hasattr(v, "strftime"):
+        return v.strftime("%Y%m%d")
+    return str(v)[:10].replace("-", "")
+
+
+def daily_data_list_from_polars(
+    df: pl.DataFrame,
+    *,
+    ts_code: str | None = None,
+) -> List[DailyData]:
+    """把 ``load_daily_for_symbol`` 等返回的日线 Polars 表转为 ``List[DailyData]``（升序）。
+
+    期望列：``date, open, high, low, close, volume``；可选 ``amount``、``pct_chg``。
+    """
+    if df.height == 0:
+        return []
+    work = df.with_columns(
+        pl.col("date").cast(pl.Datetime(time_unit="ns"), strict=False)
+    ).sort("date")
+    if ts_code is None:
+        if "symbol" not in work.columns:
+            raise ValueError("缺少 symbol 列时请显式传入 ts_code=")
+        ts_code = _to_ts_code(str(work.get_column("symbol")[0]))
+
+    dates = [_trade_date_str(x) for x in work.get_column("date").to_list()]
+    opens = work.get_column("open").cast(pl.Float64).fill_null(0.0).to_list()
+    highs = work.get_column("high").cast(pl.Float64).fill_null(0.0).to_list()
+    lows = work.get_column("low").cast(pl.Float64).fill_null(0.0).to_list()
+    closes = work.get_column("close").cast(pl.Float64).fill_null(0.0).to_list()
+    vols = work.get_column("volume").cast(pl.Float64).fill_null(0.0).to_list()
+
+    has_amount = "amount" in work.columns
+    amounts = (
+        work.get_column("amount").cast(pl.Float64).fill_null(0.0).to_list()
+        if has_amount
+        else None
+    )
+    has_pct = "pct_chg" in work.columns
+    pcts_in = (
+        work.get_column("pct_chg").cast(pl.Float64).fill_null(0.0).to_list()
+        if has_pct
+        else None
+    )
+
+    out: List[DailyData] = []
+    for i in range(work.height):
+        c = float(closes[i])
+        v = float(vols[i])
+        prev_close = float(closes[i - 1]) if i > 0 else c
+        if has_pct and pcts_in is not None:
+            pct = float(pcts_in[i])
+        elif prev_close:
+            pct = (c - prev_close) / prev_close * 100.0
+        else:
+            pct = 0.0
+        if amounts is not None:
+            amt = float(amounts[i])
+        else:
+            amt = v * c
+        out.append(
+            DailyData(
+                ts_code=ts_code,
+                trade_date=str(dates[i]),
+                open=float(opens[i]),
+                high=float(highs[i]),
+                low=float(lows[i]),
+                close=c,
+                vol=v,
+                amount=amt,
+                pct_chg=pct,
+                prev_close=prev_close,
+            )
+        )
+    return out
 
 
 def _screener_bar_rows(ts_code: str, klines: List[DailyData]) -> List[Dict[str, Any]]:
@@ -484,7 +564,7 @@ def main() -> None:
     """原 SQLite CLI 已移除。"""
     raise SystemExit(
         "请使用 analyze_screener_stock / screen_stocks_from_universe / "
-        "get_market_status_from_samples：K 线由 ``app.contrib.zettaranc.adapter`` 提供。"
+        "get_market_status_from_samples：K 线由 ``daily_data_list_from_polars``（本模块）提供。"
     )
 
 

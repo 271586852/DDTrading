@@ -109,8 +109,10 @@ def _score_zettaranc_composite_single(
 ) -> dict[str, object]:
     from app.common.market_data import _to_ts_code
     from app.common.market_repository import load_daily_for_symbol
-    from app.contrib.zettaranc.adapter import daily_data_list_from_polars
-    from app.contrib.zettaranc.screener import analyze_screener_stock
+    from app.score.score_strategies.zettaranc_screener import (
+        analyze_screener_stock,
+        daily_data_list_from_polars,
+    )
 
     df = load_daily_for_symbol(symbol).sort("date")
     if df.height < 30:
@@ -149,8 +151,8 @@ def _score_zettaranc_patterns_single(
 ) -> dict[str, object]:
     from app.common.market_data import _to_ts_code
     from app.common.market_repository import load_daily_for_symbol
-    from app.contrib.zettaranc.adapter import daily_data_list_from_polars
-    from app.contrib.zettaranc.strategies import analyze_with_strategies_from_klines
+    from app.common.indicators import analyze_with_strategies_from_klines
+    from app.score.score_strategies.zettaranc_screener import daily_data_list_from_polars
 
     df = load_daily_for_symbol(symbol).sort("date")
     if df.height < 30:
@@ -199,8 +201,10 @@ def _score_market_zettaranc_composite(
 ) -> dict[str, object]:
     from app.common.market_data import _to_ts_code
     from app.common.market_repository import load_daily
-    from app.contrib.zettaranc.adapter import daily_data_list_from_polars
-    from app.contrib.zettaranc.screener import analyze_screener_stock
+    from app.score.score_strategies.zettaranc_screener import (
+        analyze_screener_stock,
+        daily_data_list_from_polars,
+    )
 
     daily = load_daily()
     if daily.height == 0:
@@ -265,8 +269,8 @@ def _score_market_zettaranc_patterns(
 ) -> dict[str, object]:
     from app.common.market_data import _to_ts_code
     from app.common.market_repository import load_daily
-    from app.contrib.zettaranc.adapter import daily_data_list_from_polars
-    from app.contrib.zettaranc.strategies import analyze_with_strategies_from_klines
+    from app.common.indicators import analyze_with_strategies_from_klines
+    from app.score.score_strategies.zettaranc_screener import daily_data_list_from_polars
 
     daily = load_daily()
     if daily.height == 0:

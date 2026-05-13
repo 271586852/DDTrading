@@ -8,9 +8,9 @@ import pandas as pd
 import polars as pl
 
 from app.backtest.backtest_strategies.spec import TradeStrategySpec
+from app.common.indicators import bar_dict_rows_from_daily_data, detect_b1
 from app.common.market_data import _to_ts_code
-from app.contrib.zettaranc.adapter import bar_dict_rows_from_daily_data, daily_data_list_from_polars
-from app.contrib.zettaranc.strategies import detect_b1
+from app.score.score_strategies.zettaranc_screener import daily_data_list_from_polars
 
 _OHLCV_COLS = ("date", "open", "high", "low", "close", "volume")
 
