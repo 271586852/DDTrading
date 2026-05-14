@@ -88,6 +88,7 @@ def _pattern_score_from_analysis(out: dict) -> tuple[float, Dict[str, float]]:
     n_sig = int(out["total_signals"])
     latest = out["latest_signal"]
     base = 35.0
+    # 最新 BUY 信号出现时优先参考其置信度；否则退化为“近期总共出现过多少信号”。
     if latest is not None and getattr(latest, "action", "") == "BUY":
         total_score = min(100.0, base + float(latest.confidence) * 55.0)
     else:
@@ -119,6 +120,7 @@ def _score_zettaranc_composite_single(
         raise ValueError(
             f"该评分引擎需要至少 30 根日线: '{symbol}'，当前 {df.height} 根。"
         )
+    # 单股模式只截取近期窗口，避免无意义地携带过长历史数据进入评分函数。
     need = max(60, lookback_days)
     tail = df.tail(min(df.height, need))
     ts = _to_ts_code(symbol)
@@ -159,6 +161,7 @@ def _score_zettaranc_patterns_single(
         raise ValueError(
             f"该评分引擎需要至少 30 根日线: '{symbol}'，当前 {df.height} 根。"
         )
+    # 战法信号评分同样只看近期窗口，和前端展示的回看区间保持一致。
     need = max(60, lookback_days)
     tail = df.tail(min(df.height, need))
     ts = _to_ts_code(symbol)
@@ -213,6 +216,7 @@ def _score_market_zettaranc_composite(
     name_map = _name_map_from_repository()
     need = max(60, lookback_days)
     rows: List[dict[str, object]] = []
+    # 先按 symbol 分桶，后续循环只处理单只股票的局部窗口。
     chunks = daily.sort(["symbol", "date"]).partition_by("symbol", as_dict=True)
     symbols_seq = sorted(chunks.keys(), key=lambda t: str(t[0]) if t else "")
     total = len(symbols_seq)
@@ -220,6 +224,7 @@ def _score_market_zettaranc_composite(
     for i, sym_tuple in enumerate(symbols_seq):
         one = chunks[sym_tuple]
         sym = str(sym_tuple[0]) if sym_tuple else ""
+        # 每 64 只更新一次进度，避免批量扫描时产生过多状态写入。
         if (i & 0x3F) == 0 and total:
             pct = 10 + int(85 * i / total)
             _report_progress(progress, pct, f"四维评分 {i + 1}/{total}…")
@@ -279,6 +284,7 @@ def _score_market_zettaranc_patterns(
     name_map = _name_map_from_repository()
     need = max(60, lookback_days)
     rows: List[dict[str, object]] = []
+    # 与四维评分一致，先切成逐标的分组，降低后续扫描复杂度。
     chunks = daily.sort(["symbol", "date"]).partition_by("symbol", as_dict=True)
     symbols_seq = sorted(chunks.keys(), key=lambda t: str(t[0]) if t else "")
     total = len(symbols_seq)
@@ -286,6 +292,7 @@ def _score_market_zettaranc_patterns(
     for i, sym_tuple in enumerate(symbols_seq):
         one = chunks[sym_tuple]
         sym = str(sym_tuple[0]) if sym_tuple else ""
+        # 进度上报做节流，避免任务状态对象被高频更新。
         if (i & 0x3F) == 0 and total:
             pct = 10 + int(85 * i / total)
             _report_progress(progress, pct, f"战法信号评分 {i + 1}/{total}…")
@@ -340,6 +347,7 @@ def score_stocks(
 
     _report_progress(progress, 1, "准备评分…")
 
+    # 不传 symbol 表示做全市场排名；传 symbol 则走单股同步评分。
     if not target_symbol:
         _report_progress(progress, 5, "全市场扫描（仅本地 DuckDB）…")
         result = _MARKET_RUNNERS[engine](
@@ -355,6 +363,7 @@ def score_stocks(
     normalized = _normalize_ticker_input(target_symbol)
     from app.common.market_data import ensure_symbol_cached
 
+    # 单股评分允许按需补齐本地缓存，避免因为冷数据直接失败。
     ensure_symbol_cached(
         normalized,
         days=_required_fetch_days(lookback_days),
@@ -373,6 +382,7 @@ _MARKET_RUNNERS: Dict[str, Callable[..., Dict[str, object]]] = {
     "zettaranc_composite": _score_market_zettaranc_composite,
     "zettaranc_patterns": _score_market_zettaranc_patterns,
 }
+# 评分引擎注册表统一由 service 持有，策略元数据只声明 score_engine 名称。
 _SINGLE_RUNNERS: Dict[str, Callable[..., Dict[str, object]]] = {
     "zettaranc_composite": _score_zettaranc_composite_single,
     "zettaranc_patterns": _score_zettaranc_patterns_single,

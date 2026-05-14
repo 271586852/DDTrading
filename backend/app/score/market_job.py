@@ -29,6 +29,7 @@ class ScoreMarketJob:
 def _evict_oldest_unlocked() -> None:
     if len(_jobs) <= _MAX_JOBS:
         return
+    # 一次多清理一些老任务，避免容量刚到阈值时频繁触发淘汰。
     overflow = len(_jobs) - _MAX_JOBS + 20
     if overflow <= 0:
         return
@@ -50,6 +51,7 @@ def get_job(job_id: str) -> ScoreMarketJob | None:
         job = _jobs.get(job_id)
         if job is None:
             return None
+        # 返回快照副本，避免调用方拿到共享对象后绕过锁直接修改内存态。
         return ScoreMarketJob(
             status=job.status,
             progress=job.progress,

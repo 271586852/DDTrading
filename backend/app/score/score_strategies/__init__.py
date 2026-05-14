@@ -12,6 +12,7 @@ _SKIP_MODULES = frozenset(
     {
         "spec",
         "__init__",
+        # screener 是算法实现与工具集合，不是带 STRATEGY 的可注册元数据模块。
         "zettaranc_screener",
     }
 )
@@ -19,6 +20,7 @@ _SKIP_MODULES = frozenset(
 
 def _discover_strategies() -> tuple[ScoringStrategy, ...]:
     found: list[ScoringStrategy] = []
+    # 约定优于配置：扫描子模块，凡是导出 STRATEGY 的都自动纳入预设策略列表。
     for info in pkgutil.iter_modules(_pkg.__path__, _pkg.__name__ + "."):
         short = info.name.rsplit(".", 1)[-1]
         if short in _SKIP_MODULES:
@@ -45,12 +47,14 @@ def get_strategy(strategy_id: str) -> ScoringStrategy:
         return _STRATEGY_MAP[str(strategy_id)]
     except KeyError as exc:
         available = ", ".join(_STRATEGY_MAP.keys())
+        # 直接把可用策略名带回去，方便 API 层原样透传给调用方排查。
         raise KeyError(
             f"Unknown scoring strategy '{strategy_id}'. Available: {available}."
         ) from exc
 
 
 def strategy_exists(strategy_id: str) -> bool:
+    """判断策略 id 是否已注册。"""
     return strategy_id in _STRATEGY_MAP
 
 

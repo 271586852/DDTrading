@@ -32,6 +32,8 @@ class ScoreRequest(BaseModel):
 
 
 class RankedStock(BaseModel):
+    """排行结果中的单条股票记录。"""
+
     rank: int
     ticker: str
     name: str
@@ -75,6 +77,7 @@ class StrategyInfo(BaseModel):
 
 
 class ScoreResponse(BaseModel):
+    # 评分引擎内部可能附带一些调试字段；对外响应选择忽略未知字段以降低耦合。
     model_config = ConfigDict(extra="ignore")
 
     total_universe: int
@@ -95,10 +98,14 @@ class ScoreResponse(BaseModel):
 
 
 class MarketScoreJobStarted(BaseModel):
+    """异步全市场评分任务创建成功后的最小回执。"""
+
     job_id: str = Field(description="用于轮询 GET /score/market-job/{job_id} 的任务 id。")
 
 
 class MarketScoreJobStatus(BaseModel):
+    """异步评分任务的轮询结果。"""
+
     status: Literal["pending", "running", "completed", "failed"] = Field(
         description="pending=已创建；running=执行中；completed=成功；failed=异常结束。"
     )
@@ -149,6 +156,8 @@ class BacktestReportRequest(BacktestRequest):
 
 
 class BacktestDateRange(BaseModel):
+    """闭区间日期范围。"""
+
     start: date
     end: date
 
@@ -201,6 +210,8 @@ class TradeMarker(BaseModel):
 
 
 class BacktestResponse(BaseModel):
+    """单股回测的完整响应体。"""
+
     symbol: str
     requested_range: BacktestDateRange
     effective_range: BacktestDateRange = Field(
@@ -230,6 +241,7 @@ class BacktestResponse(BaseModel):
     )
     recent_positions: List[Dict[str, Any]] = Field(
         default_factory=list,
+        # 历史前端曾依赖该字段；当前保留空列表以兼容旧页面，不再承载真实持仓数据。
         description="兼容字段，当前为空列表；持仓请使用 daily_positions。",
     )
     daily_positions: List[Dict[str, Any]] = Field(
@@ -244,6 +256,8 @@ class BacktestResponse(BaseModel):
 
 
 class QuoteCandle(BaseModel):
+    """单根 K 线快照。"""
+
     date: Optional[str] = None
     open: Optional[float] = None
     high: Optional[float] = None

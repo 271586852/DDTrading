@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.score.score_strategies.spec import FactorFieldMeta, ScoringStrategy
 
+# 这里只声明策略元数据；实际信号统计与评分实现位于 score.service。
 STRATEGY = ScoringStrategy(
     id="zettaranc_patterns",
     name="Z 哥战法信号",

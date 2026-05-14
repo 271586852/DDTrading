@@ -34,6 +34,7 @@ def daily_data_list_from_polars(
     """
     if df.height == 0:
         return []
+    # 统一转成按日期升序的 DailyData，后面的指标函数都假设输入满足这个顺序。
     work = df.with_columns(
         pl.col("date").cast(pl.Datetime(time_unit="ns"), strict=False)
     ).sort("date")
@@ -76,6 +77,7 @@ def daily_data_list_from_polars(
         if amounts is not None:
             amt = float(amounts[i])
         else:
+            # 历史表未提供 amount 时，用成交量 * 收盘价兜底出近似成交额。
             amt = v * c
         out.append(
             DailyData(
@@ -96,6 +98,7 @@ def daily_data_list_from_polars(
 
 def _screener_bar_rows(ts_code: str, klines: List[DailyData]) -> List[Dict[str, Any]]:
     rows = bar_dict_rows_from_daily_data(klines)
+    # 下游部分信号函数依赖 ts_code 字段，这里补齐成统一结构。
     for r in rows:
         r["ts_code"] = ts_code
     return rows
@@ -159,6 +162,7 @@ def calculate_kdj(klines: List[Dict], period: int = 9) -> Tuple[float, float, fl
         return 50, 50, 50
 
     rsv_list = []
+    # 先滚动计算 RSV，再按经典 KDJ 平滑公式递推 K / D / J。
     for i in range(period - 1, len(klines)):
         low_list = [klines[j]['low'] for j in range(i - period + 1, i + 1)]
         high_list = [klines[j]['high'] for j in range(i - period + 1, i + 1)]
@@ -447,10 +451,12 @@ def analyze_screener_stock(
     volume_score, volume_reasons = score_volume_pattern(klines)
     risk_score, risk_warnings = score_risk(klines)
 
+    # 总分采用固定权重，B1 机会权重最高，其次是趋势和量价，最后是风险安全垫。
     total_score = b1_score * 0.3 + trend_score * 0.25 + volume_score * 0.25 + risk_score * 0.2
 
     is_perfect, perfect_reasons = is_perfect_pattern(klines)
     if is_perfect:
+        # “完美图形”只做加成，不改动四个子分本身，便于前端解释各因子来源。
         total_score = min(100, total_score * 1.1)
         b1_reasons.extend(perfect_reasons)
 
@@ -477,6 +483,7 @@ def screen_stocks_from_universe(
         if len(dkl) < 30:
             continue
         score = analyze_screener_stock(ts_code, dkl, name=stock_name)
+        # 这里的 criteria 不是独立算法，只是对同一份评分结果做不同视角的过滤。
         if criteria == "b1" and score.b1_score >= 50:
             results.append(score)
         elif criteria == "perfect" and score.score >= 65:
@@ -504,6 +511,7 @@ def get_market_status_from_samples(latest_pct_chgs: List[float]) -> MarketStatus
     total_count = len(latest_pct_chgs)
     rise_ratio = rise_count / total_count if total_count else 0.5
 
+    # 这里只做轻量情绪估算，不引入指数、成交额等更复杂的市场宽度指标。
     if rise_ratio >= 0.6:
         direction = "LONG"
         strength = 75.0

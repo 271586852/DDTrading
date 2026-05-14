@@ -59,6 +59,7 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+# 目前前后端通常分域名/端口部署，这里统一放开配置项控制的跨域来源。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_cors_origins(),
@@ -83,6 +84,7 @@ def market_data_revision() -> dict[str, float]:
 def get_strategies() -> List[StrategyInfo]:
     """列出所有预设评分策略。"""
     return [
+        # 这里把 dataclass 策略元数据显式转成 API schema，避免把内部实现细节直接暴露给前端。
         StrategyInfo(
             id=s.id,
             name=s.name,
@@ -108,6 +110,7 @@ def _run_market_score_job(job_id: str, payload: ScoreRequest) -> None:
     update_job(job_id, status="running", progress=0, stage="开始…")
 
     def report(pct: int, msg: str) -> None:
+        # score.service 只负责回调进度，不感知任务存储细节；这里负责桥接到内存态任务表。
         update_job(job_id, status="running", progress=pct, stage=msg)
 
     try:
@@ -138,6 +141,7 @@ def get_market_score_job(job_id: str) -> MarketScoreJobStatus:
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在或已过期。")
+    # 任务表里存的是原始 dict，返回前再过一遍 Pydantic，确保轮询接口结构稳定。
     result_model = (
         ScoreResponse.model_validate(job.result) if job.result is not None else None
     )
@@ -170,6 +174,7 @@ def calculate_scores(payload: ScoreRequest) -> ScoreResponse:
     except Exception as exc:  # pragma: no cover - defensive API boundary
         raise HTTPException(status_code=500, detail=f"Scoring failed: {exc}") from exc
 
+    # 服务层返回的是通用 dict，这里由响应模型统一裁剪/校验输出结构。
     return ScoreResponse.model_validate(result)
 
 
@@ -222,6 +227,7 @@ def export_backtest_report_endpoint(payload: BacktestReportRequest) -> Response:
     try:
         html = export_single_symbol_backtest_report(payload)
         filename = f"backtest_{payload.symbol.zfill(6)}_{payload.start_date}_{payload.end_date}.html"
+        # 直接返回 HTML 附件，避免前端再拼 Blob 或自行处理字符集。
         return Response(
             content=html,
             media_type="text/html; charset=utf-8",
@@ -252,6 +258,7 @@ def refresh_data(
     """
     try:
         summary = refresh_market_data(mode=mode, force=force)
+        # 某些情况下会因为冷却窗口而短路，此时明确返回 skipped 方便前端提示用户。
         if summary.get("skipped"):
             return {"status": "skipped", "mode": mode, "summary": summary}
         return {"status": "ok", "mode": mode, "summary": summary}

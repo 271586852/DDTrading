@@ -5,9 +5,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 ZScoreOrientation = Literal[
+    # 数值越大越好，前端可据此决定排序方向或色彩语义。
     "higher_better",
+    # 数值越小越好，例如波动率、回撤等风险类指标。
     "lower_better",
+    # 引擎已经直接返回 0~100 分位值，无需再次标准化。
     "value_as_percentile_0_100",
+    # 不参与 z-score / 分位解释，只做原值展示。
     "none",
 ]
 
@@ -24,6 +28,7 @@ ValueFormatKind = Literal[
 class FactorFieldMeta:
     """单条分项的展示与 z 分位语义（供 API / 前端强解耦渲染）。"""
 
+    # 键名必须与评分结果中的 ``factor_values`` / ``factor_zscores`` 一致。
     key: str
     label: str
     value_format: ValueFormatKind
@@ -50,4 +55,5 @@ class ScoringStrategy:
 
     @property
     def factor_keys(self) -> tuple[str, ...]:
+        """返回所有分项键，供响应构造和前端列定义复用。"""
         return tuple(f.key for f in self.factor_fields)

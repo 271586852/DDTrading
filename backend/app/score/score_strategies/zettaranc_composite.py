@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.score.score_strategies.spec import FactorFieldMeta, ScoringStrategy
 
+# 这里只声明策略元数据；实际打分实现位于 score.service / zettaranc_screener。
 STRATEGY = ScoringStrategy(
     id="zettaranc_composite",
     name="Z 哥四维选股",
